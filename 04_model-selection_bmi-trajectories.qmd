@@ -1,0 +1,1641 @@
+---
+title: "Data analysis of BMI trajectories in Leicester Respiratory Cohorts"
+author: "Lorenz Leuenberger"
+date: "`r date()`"
+title-block-banner: "#e4003c"
+format: 
+  html:
+    toc: true
+    number-sections: true
+    code-fold: show
+    code-tools: true
+    df-print: paged
+    embed-resources: true
+editor_options: 
+  chunk_output_type: inline
+---
+
+
+# Introduction
+
+After estimating the Group based trajectory models and Growth mixture models for BMI trajectories on the [High Performance Computing (HPC) of the University of Bern](https://hpc-unibe-ch.github.io/), I can now go ahead with the model selection and data analysis.
+
+- I will first choose the model best representing the BMI trajectories in the Leicester Respiratory Cohorts.
+- I will then perform the formal analysis of describing characteristics of participants across trajectories, identifying risk groups and risk factors.
+
+
+
+## Load libraries
+
+Load libraries
+
+```{r}
+#| warning: false
+
+library(tidyverse)
+library(here)
+library(lcmm)
+library(splines)
+library(tidyLPA)
+library(gtsummary)
+
+```
+
+## Import data
+
+```{r}
+#| warning: false
+#| message: false
+
+interpolated_ukwho_bmi <- read.csv(here("data", "interpolated-growth-references", "interpolated_ukwho_bmi.csv"))
+
+Leicester_anthro_pseudonymized <- read_csv(here("data", "processed", "Leicester_anthro_pseudonymized_18.csv"))
+pseudonymization_key <- read_csv(here("data", "processed", "pseudonymization_key_18.csv"))
+
+C1_outcomes_covariates <- read_csv(here("data", "processed", "C1_outcomes_covariates.csv"))
+C2_outcomes_covariates <- read_csv(here("data", "processed", "C2_outcomes_covariates.csv"))
+C3_outcomes_covariates <- read_csv(here("data", "processed", "C3_outcomes_covariates.csv"))
+
+
+# Load models
+files <- list.files(path = here("ubelix", "input", "final_splines"), recursive = TRUE, full.names = TRUE)
+lapply(files, load, .GlobalEnv)
+
+files <- list.files(path = here("ubelix", "output", "final_splines"), recursive = TRUE, full.names = TRUE)
+lapply(files, load, .GlobalEnv)
+
+```
+
+Clean growth reference data:
+
+```{r}
+
+z_score_overweight <- qnorm(0.91)
+z_score_obesity <- qnorm(0.98)
+
+data_bmi_reference <- interpolated_ukwho_bmi %>%
+  filter(age_days <= 6574) %>% 
+  select(age_days, sex, M, L, S) %>% 
+  pivot_wider(id_cols = "age_days", names_from = "sex", values_from = c("M", "L", "S")) %>% 
+  mutate(cutoff_overweight_f = M_f * (1 + L_f * S_f * z_score_overweight)^(1 / L_f),
+         cutoff_obesity_f = M_f * (1 + L_f * S_f * z_score_obesity)^(1 / L_f),
+         cutoff_overweight_m = M_m * (1 + L_m * S_m * z_score_overweight)^(1 / L_m),
+         cutoff_obesity_m = M_m * (1 + L_m * S_m * z_score_obesity)^(1 / L_m),
+         lower_overweight_who = (cutoff_overweight_f+cutoff_overweight_m)/2,
+         lower_obesity_who = (cutoff_obesity_f+cutoff_obesity_m)/2,
+         upper_overweight_who = lower_obesity_who,
+         upper_obesity_who = Inf) %>% 
+  mutate(age_years = age_days/365.25,
+         mean_who = (M_f+M_m)/2) %>% 
+  select(age_years, lower_overweight_who, lower_obesity_who, upper_overweight_who, upper_obesity_who, mean_who) %>% 
+  pivot_longer(
+    cols = c(lower_overweight_who, lower_obesity_who, upper_overweight_who, upper_obesity_who, mean_who),
+    names_to = c(".value", "class"),
+    names_sep = "_"
+  ) %>% 
+  mutate(class = case_when(class == "who" ~ "50th percentile",
+                           TRUE ~ class))
+
+```
+
+Clean Leicester anthropometric data
+
+```{r}
+
+Leicester_anthro <- Leicester_anthro_pseudonymized %>% 
+  left_join(pseudonymization_key, by=c("participant_id" = "participant_id")) %>% 
+  select(serialno, participant_id, age_years, bmi, z_bmi)
+
+```
+
+Clean Leicester covariates data
+
+```{r}
+
+C1_outcomes_covariates <- C1_outcomes_covariates %>% 
+  select(serialno, cohort_number, sex, gestational_age, birth_weight, older_siblings, age_mother_delivery, smoking_mother_pregnancy, breast_feeding, ethnicity_cohort, ethnicity, ethnicity_mother, ethnicity_father, age_mother_education, age_father_education, day_care, urban_1998, townsend)
+
+C2_outcomes_covariates <- C2_outcomes_covariates %>%
+  mutate(cohort_number = "Cohort 2 (1998a)") %>% 
+  select(serialno, cohort_number, sex, gestational_age, birth_weight, older_siblings, age_mother_delivery, smoking_mother_pregnancy, breast_feeding, ethnicity_cohort, ethnicity, ethnicity_mother, ethnicity_father, age_mother_education, age_father_education, day_care, urban_1998, townsend)
+
+C3_outcomes_covariates <- C3_outcomes_covariates %>%
+  mutate(cohort_number = "Cohort 3 (1998b)") %>% 
+  select(serialno, cohort_number, sex, gestational_age, birth_weight, older_siblings, age_mother_delivery, smoking_mother_pregnancy, breast_feeding, ethnicity_cohort, ethnicity, ethnicity_mother, ethnicity_father, age_mother_education, age_father_education, day_care, urban_1998, townsend)
+
+Leicester_covariates <- rbind(C1_outcomes_covariates, C2_outcomes_covariates, C3_outcomes_covariates) %>% 
+    left_join(pseudonymization_key, by=c("serialno" = "serialno"))
+
+```
+
+
+## Define functions
+
+Function to calculate z-scores
+
+```{r}
+
+z_score_calc_corr = function(L,M,S,parameter){
+  if(is.na(L)|is.na(M)|is.na(S)|is.na(parameter)){
+    return(NA)
+  }
+  z_score = ((parameter/M)^L-1)/(S*L)
+  if (z_score > 3){
+    SD3pos = M*(1+S*L*3)^(1/L)
+    SD2pos = M*(1+S*L*2)^(1/L)
+    SD23pos = SD3pos - SD2pos
+    z_score = 3+((parameter-SD3pos)/SD23pos)
+    return(z_score)
+  } else if (z_score < -3){
+    SD3neg = M*(1+S*L*(-3))^(1/L)
+    SD2neg = M*(1+S*L*(-2))^(1/L)
+    SD23neg = SD2neg - SD3neg
+    z_score = -3+((parameter-SD3neg)/SD23neg)
+    return(z_score)
+  } else{
+    return(z_score)
+  }
+}
+
+```
+
+
+
+Functions to plot hlme model.
+
+
+```{r}
+
+plot_hlme_model_bmi <- function(hlme_model, age = 18){
+
+num_classes <- hlme_model$ng
+  
+data_predict <- data.frame(age_days = seq(14, trunc(age*365.25))) %>% 
+  mutate(age_years = age_days/365.25)
+
+predictions <- predictY(hlme_model, data_predict, var.time = "age_years", draws = TRUE)
+  
+data_predict <- data.frame(predictions[2], predictions[1])
+  
+if (num_classes == 1){
+  data_predict <- data_predict %>% 
+    rename("pred.Ypred_class1" = "pred.Ypred", "pred.lower.Ypred_class1" = "pred.lower.Ypred", "pred.upper.Ypred_class1" = "pred.upper.Ypred")
+  
+}
+
+rename_columns <- setNames(
+  paste0("pred.Ypred_class", 1:num_classes), 
+  paste0("mean_class", 1:num_classes)
+)
+  
+col_names <- names(data_predict)
+  
+for (i in 1:num_classes) {
+    # Adjust column names based on the pattern in your `predictions`
+    mean_col <- paste0("pred.Ypred_class", i)
+    if (mean_col %in% col_names) {
+      colnames(data_predict)[which(colnames(data_predict) == mean_col)] <- paste0("mean_class", i)
+    }
+  }
+
+for (i in 1:num_classes) {
+    lower_col <- paste0("pred.lower.Ypred_class", i)
+    upper_col <- paste0("pred.upper.Ypred_class", i)
+    
+    if (lower_col %in% col_names) {
+      colnames(data_predict)[which(colnames(data_predict) == lower_col)] <- paste0("lower_class", i)
+    }
+    
+    if (upper_col %in% col_names) {
+      colnames(data_predict)[which(colnames(data_predict) == upper_col)] <- paste0("upper_class", i)
+    }
+  }
+
+data_predict <- data_predict %>% 
+  pivot_longer(cols = -age_years,
+               names_to = c(".value", "class"),
+               names_sep = "_",
+               values_to = "value")
+
+data_predict <- rbind(data_predict, data_bmi_reference)
+
+color_values <- c("obesity" = "grey5", "overweight" = "grey40", "50th percentile" = "black")
+class_colors <- scales::hue_pal()(num_classes)
+class_names <- paste0("class", 1:num_classes)
+
+for (i in 1:num_classes) {
+    color_values[class_names[i]] <- class_colors[i]
+  }
+  
+fill_values <- color_values
+
+random_effects <- hlme_model$call$random
+
+if (random_effects == "~-1"){
+  subtitle <- "Group Based Trajectory Model, no random effects"
+} else if (random_effects == "~1") {
+  subtitle <- "Growth Mixture Model, random intercept"
+} else {
+  subtitle <- "Growth Mixture Model, random intercept + slope"
+}
+  
+p <- ggplot(data_predict, aes(x = age_years, y = mean, color = class)) +
+  geom_line() +
+  geom_ribbon(aes(ymin = lower, ymax = upper, fill = class), alpha = 0.3) +
+  scale_fill_manual(values = fill_values) +
+  scale_color_manual(values = color_values) +
+  labs(subtitle = subtitle,
+       title = "Estimated mean trajectories from marginal predictions",
+       x = "Age (years)",
+       y = (bquote(Mean~BMI~(kg/m^2))))+
+  scale_x_continuous(limits = c(0, age), expand = c(0,0))+
+  scale_y_continuous(expand = c(0,0))+
+  theme_minimal()
+
+return(p)
+}
+
+plot_hlme_model_zbmi <- function(hlme_model, age = 18){
+
+participants_class <- hlme_model[[17]]
+
+plot_data <- Leicester_anthro %>% 
+  left_join(participants_class, by = c("participant_id")) %>% 
+  mutate(class = factor(class))
+
+random_effects <- hlme_model$call$random
+
+if (random_effects == "~-1"){
+  subtitle <- "Group Based Trajectory Model, no random effects"
+} else if (random_effects == "~1") {
+  subtitle <- "Growth Mixture Model, random intercept"
+} else {
+  subtitle <- "Growth Mixture Model, random intercept + slope"
+}
+
+if (age == 18){
+  knots = c(0.5875055, 7.251932, 14.35975)
+} else if (age == 15) {
+  knots = c(0.5989065, 7.3708995)
+} else {
+  knots = c(0.6, 7.4)
+}
+  
+p <- ggplot(plot_data) +
+  geom_smooth(aes(x = age_years, y = z_bmi, color = class, fill = class), method = "gam",
+              formula = y ~ bs(x, knots = knots, df = 5)) +
+  labs(subtitle = subtitle,
+       title = "Estimated mean trajectories from observed z-scores") +
+  xlab("Age (years)") +
+  ylab("BMI z-score") +
+  scale_x_continuous(limits = c(0, age), expand = c(0,0))+
+  scale_y_continuous(expand = c(0,0))+
+  theme_minimal()+
+  annotate("rect", xmin = -Inf, xmax = Inf, ymin = z_score_overweight, ymax = z_score_obesity, 
+           fill = "grey40", alpha = 0.3) +
+  annotate("rect", xmin = -Inf, xmax = Inf, ymin = z_score_obesity, ymax = Inf, 
+           fill = "grey5", alpha = 0.3)
+
+
+p
+  
+return(p)
+}
+
+plot_hlme_observed_predicted <- function (x, var.time, break.times = NULL, marg = TRUE, outcome = 1, subset = NULL, shades = FALSE, data, ...) {
+    if (missing(x)){
+        stop("Argument x should be specified")
+    }
+    if (!inherits(x, c("hlme", "lcmm", "Jointlcmm", "multlcmm"))){ 
+        stop("Use with hlme, lcmm, multlcmm or Jointlcmm only")
+    }
+    if (missing(var.time)){
+        stop("Argument var.time should be specified")
+    }
+    if (any(x$linktype == 3)){
+        stop("This function is not available for thresholds mixed models")
+    }
+  
+    if (missing(data)){
+        stop("Argument data should be specified")
+    }
+    
+    data <- data.frame(data)  
+  
+    if (!isTRUE(all.equal(as.character(x$call$subset), character(0)))) {
+        cc <- x$call
+        cc <- cc[c(1, which(names(x$call) == "subset"))]
+        cc[[1]] <- as.name("model.frame")
+        cc$formula <- formula(paste("~", paste(colnames(data), 
+            collapse = "+")))
+        cc$data <- data
+        cc$na.action <- na.pass
+        data <- eval(cc)
+        attributes(data)$terms <- NULL
+    }
+    if (inherits(x, c("hlme", "lcmm", "Jointlcmm"))) {
+        if (length(x$na.action)) 
+            data <- data[-x$na.action, ]
+    }
+    else {
+        if (is.numeric(outcome)) {
+            linesNA <- x$na.action[[outcome]]
+        }
+        if (is.character(outcome)) {
+            numoutcome <- which(x$Ynames == outcome)
+            if (length(numoutcome) == 0) 
+                stop("Argument 'outcome' is not correct")
+            linesNA <- x$na.action[[numoutcome]]
+        }
+        if (length(linesNA)) 
+            data <- data[-linesNA, ]
+    }
+    timeInterv <- data[, var.time]
+    subset2 <- try(as.numeric(subset), silent = TRUE)
+    if (length(subset2)) {
+        data <- do.call("model.frame", args = list(formula = formula(paste("~", 
+            paste(colnames(data), collapse = "+"))), subset = sys.call(which = -1)$subset, 
+            data = data, na.action = na.pass))
+        ids <- unique(data[, x$call$subject])
+        xorig <- x
+        x$pprob <- xorig$pprob[which(xorig$pprob[, 1] %in% ids), 
+            ]
+        x$pred <- xorig$pred[which(xorig$pred[, 1] %in% ids), 
+            ]
+    }
+    if (is.null(break.times)) 
+        break.times <- quantile(timeInterv, prob = seq(0, 1, 
+            length.out = 10))
+    else {
+        if (length(break.times) == 1) 
+            break.times <- quantile(timeInterv, prob = seq(0, 
+                1, length.out = break.times))
+    }
+    break.times <- sort(break.times)
+    ng <- x$ng
+    nea <- sum(x$idea)
+    ntps <- length(break.times) - 1
+    numsg <- lapply(1:ng, function(g) x$pprob[which(x$pprob$class == 
+        g), 1])
+    if (length(x$var.time)) 
+        times <- x$pred[, ncol(x$pred)]
+    else times <- data[, var.time]
+    maxT <- sapply(numsg, function(y) max(times[which(data[, 
+        x$call$subject] %in% y)]))
+    if (marg == TRUE) {
+        if (inherits(x, c("hlme", "lcmm", "Jointlcmm"))) {
+            pred0 <- x$pred[, c(1, 6, 6 + 1:ng), drop = FALSE]
+        }
+        else {
+            if (is.numeric(outcome)) 
+                indpred <- which(x$pred[, "Yname"] == x$Ynames[outcome])
+            if (is.character(outcome)) 
+                indpred <- which(x$pred[, "Yname"] == outcome)
+            if (length(indpred) == 0) 
+                stop("Argument outcome is not correct")
+            pred0 <- x$pred[indpred, c(1, 7, 7 + 1:ng), drop = FALSE]
+            if (length(x$var.time)) 
+                times <- x$pred[indpred, ncol(x$pred)]
+        }
+        ppi <- x$pprob[, c(1, 2 + 1:ng), drop = FALSE]
+        name.id <- colnames(x$pred)[1]
+        pred0 <- cbind(pred0, times)
+        pred_complet0 <- merge(pred0, ppi, by = name.id)
+        pred_times0 <- matrix(NA, length(break.times) - 1, 4 * 
+            ng + 1)
+        pred_times0[, 1] <- (break.times[-length(break.times)] + 
+            break.times[-1])/2
+        colnames(pred_times0) <- c(var.time, paste("pred.class", 
+            1:ng, sep = ""), paste("obs.class", 1:ng, sep = ""), 
+            paste("lower.obs.class", 1:ng, sep = ""), paste("upper.obs.class", 
+                1:ng, sep = ""))
+        for (i in 1:ntps) {
+            indg <- lapply(1:ng, function(g) which((pred_complet0[, 
+                ng + 3] >= break.times[i]) & (pred_complet0[, 
+                ng + 3] < min(break.times[i + 1], maxT[g]))))
+            if (i == (length(break.times) - 1)) 
+                indg <- lapply(1:ng, function(g) {
+                  if (maxT[g] > break.times[i]) 
+                    c(indg[[g]], which((pred_complet0[, ng + 
+                      3] == min(break.times[i + 1], maxT[g]))))
+                  else indg[[g]]
+                })
+            if (any(sapply(indg, length) > 0)) {
+                pred_times0[i, 1 + 1:ng] <- sapply(1:ng, function(g) sum(pred_complet0[indg[[g]], 
+                  2 + g] * pred_complet0[indg[[g]], ng + 3 + 
+                  g])/sum(pred_complet0[indg[[g]], ng + 3 + g]))
+                pred_times0[i, 1 + ng + 1:ng] <- sapply(1:ng, 
+                  function(g) sum(pred_complet0[indg[[g]], 2] * 
+                    pred_complet0[indg[[g]], ng + 3 + g])/sum(pred_complet0[indg[[g]], 
+                    ng + 3 + g]))
+                sd_obs <- sapply(1:ng, function(g) sd(pred_complet0[indg[[g]], 
+                  2]) * sqrt(sum(pred_complet0[indg[[g]], ng + 
+                  3 + g]^2)/sum(pred_complet0[indg[[g]], ng + 
+                  3 + g])^2))
+                pred_times0[i, 1 + 2 * ng + 1:ng] <- pred_times0[i, 
+                  1 + ng + 1:ng] - 1.96 * sd_obs
+                pred_times0[i, 1 + 3 * ng + 1:ng] <- pred_times0[i, 
+                  1 + ng + 1:ng] + 1.96 * sd_obs
+            }
+        }
+    }
+    pred_times <- NA
+    if (marg == FALSE) {
+        if (inherits(x, c("hlme", "lcmm", "Jointlcmm"))) {
+            pred <- x$pred[, c(1, 6, 6 + ng + 1:ng), drop = FALSE]
+        }
+        else {
+            if (is.numeric(outcome)) 
+                indpred <- which(x$pred[, "Yname"] == x$Ynames[outcome])
+            if (is.character(outcome)) 
+                indpred <- which(x$pred[, "Yname"] == outcome)
+            if (length(indpred) == 0) 
+                stop("Argument outcome is not correct")
+            pred <- x$pred[indpred, c(1, 7, 7 + ng + 1:ng), drop = FALSE]
+            if (length(x$var.time)) 
+                times <- x$pred[indpred, ncol(x$pred)]
+        }
+        ppi <- x$pprob[, c(1, 2 + 1:ng), drop = FALSE]
+        name.id <- colnames(x$pred)[1]
+        pred <- cbind(pred, times)
+        pred_complet <- merge(pred, ppi, by = name.id)
+        pred_times <- matrix(NA, length(break.times) - 1, 4 * 
+            ng + 1)
+        pred_times[, 1] <- (break.times[-length(break.times)] + 
+            break.times[-1])/2
+        colnames(pred_times) <- c(var.time, paste("pred.class", 
+            1:ng, sep = ""), paste("obs.class", 1:ng, sep = ""), 
+            paste("lower.obs.class", 1:ng, sep = ""), paste("upper.obs.class", 
+                1:ng, sep = ""))
+        for (i in 1:ntps) {
+            indg <- lapply(1:ng, function(g) which((pred_complet[, 
+                ng + 3] >= break.times[i]) & (pred_complet[, 
+                ng + 3] < min(break.times[i + 1], maxT[g]))))
+            if (i == (length(break.times) - 1)) 
+                indg <- lapply(1:ng, function(g) {
+                  if (maxT[g] > break.times[i]) 
+                    c(indg[[g]], which((pred_complet[, ng + 3] == 
+                      min(break.times[i + 1], maxT[g]))))
+                  else indg[[g]]
+                })
+            if (any(sapply(indg, length) > 0)) {
+                pred_times[i, 1 + 1:ng] <- sapply(1:ng, function(g) sum(pred_complet[indg[[g]], 
+                  2 + g] * pred_complet[indg[[g]], ng + 3 + g])/sum(pred_complet[indg[[g]], 
+                  ng + 3 + g]))
+                pred_times[i, 1 + ng + 1:ng] <- sapply(1:ng, 
+                  function(g) sum(pred_complet[indg[[g]], 2] * 
+                    pred_complet[indg[[g]], ng + 3 + g])/sum(pred_complet[indg[[g]], 
+                    ng + 3 + g]))
+                sd_obs <- sapply(1:ng, function(g) sd(pred_complet[indg[[g]], 
+                  2]) * sqrt(sum(pred_complet[indg[[g]], ng + 
+                  3 + g]^2)/sum(pred_complet[indg[[g]], ng + 
+                  3 + g])^2))
+                pred_times[i, 1 + 2 * ng + 1:ng] <- pred_times[i, 
+                  1 + ng + 1:ng] - 1.96 * sd_obs
+                pred_times[i, 1 + 3 * ng + 1:ng] <- pred_times[i, 
+                  1 + ng + 1:ng] + 1.96 * sd_obs
+            }
+        }
+    }
+    
+    random_effects <- x$call$random
+    
+    if (random_effects == "~-1"){
+      subtitle <- "Group Based Trajectory Model, no random effects"
+      } else if (random_effects == "~1") {
+        subtitle <- "Growth Mixture Model, random intercept"
+        } else {
+          subtitle <- "Growth Mixture Model, random intercept + slope"
+          }
+    
+    if(marg == TRUE){
+      
+      pred_times0 <- data.frame(pred_times0) %>% 
+        pivot_longer(
+          cols = -age_years,
+          names_to = c(".value", "class"),
+          names_pattern = "(.*)\\.class(\\d+)"
+        )
+      
+      plot <- pred_times0 %>%
+        ggplot(aes(x = age_years, y = obs, color = class)) +
+        geom_line() +
+        geom_ribbon(aes(ymin = lower.obs, ymax = upper.obs, fill = class), alpha = 0.3) +
+        geom_point(aes(y = pred, shape = "Predicted", color = class)) +
+        geom_point(aes(y = obs, shape = "Observed", color = class), alpha = 0) +
+        scale_shape_manual(values = c("Predicted" = 16, "Observed" = 95))+
+        labs(title = "Observed vs. predicted trajectories",
+             subtitle = subtitle,
+             x = "Age (years)",
+             y = bquote(BMI~~(kg/m^2)))+
+        theme_minimal()+
+        guides(
+          color = guide_legend("Trajectory"),
+          fill = guide_legend("Trajectory"),
+          shape = guide_legend(override.aes = list(alpha = 1, color = "black", size = 2), "Observed vs. Predicted")
+        )
+    }
+    
+    return(plot)
+  
+}
+
+
+```
+
+
+Write function that selects models with the following requirements:
+
+- class sizes: ≥ 0.05
+- entropy level: ≥0.6
+- average posterior probabilities: ≥0.7
+- proportions of participants with posterior probability ≥0.7: ≥0.5
+
+```{r}
+
+select_models <- function(models, entropy = 0.6, class_size = 0.05, avg_post_prob = 0.7, prop_above_avg_post_prob = 0.5, threshold = 0.7){
+  
+  excluded_models <- c()
+  
+  
+  for (i in 1:length(models)){
+    
+    model <- models[[i]]
+    model_name <- names(models)[i]
+    
+    if (model$ng == 1){
+      cat("check model:\t", model_name, "\n\n", sep = "")
+      
+      cat("1-class model")
+      
+      cat("select model:\t", model_name, "\n\n", sep = "")
+      cat(paste(rep("-",80), collapse= ""), "\n\n", sep = "")
+      
+    } else {
+    
+    cat("check model:\t", model_name, "\n\n", sep = "")
+    
+    invisible(capture.output(suppressMessages(suppressWarnings(model_class_sizes <- summarytable(model, which = c("%class"))/100))))
+    invisible(capture.output(suppressMessages(suppressWarnings(model_entropy <- summarytable(model, which = c("entropy"))[1,1]))))
+    (capture.output(suppressMessages(suppressWarnings(model_n_classes <- summarytable(model, which = c("G"))[1,1]))))
+    model_avg_post_prob <- c()
+    
+    for (n_class in model_n_classes){
+      
+      capture.output(suppressMessages(suppressWarnings(model_avg_post_prob <- c(model_avg_post_prob,postprob(model, threshold = threshold)[[2]][n_class, n_class]))))
+      
+    }
+    
+    capture.output(suppressMessages(suppressWarnings(model_prop_above_avg_post_prob <- postprob(model, threshold = threshold)[[3]]/100)))
+    
+    if (min(model_class_sizes) < class_size){
+      
+      cat("class sizes > ", class_size,":\tFALSE\nmin class size:\t\t", min(model_class_sizes), "\n\n", sep = "")
+      
+    } else {
+      
+      cat("class sizes > ", class_size,":\tTRUE\nmin class size:\t\t", min(model_class_sizes), "\n\n", sep = "")
+      
+    }
+    
+    if (model_entropy < entropy){
+      
+      cat("entropy > ", entropy,":\tFALSE\nentropy:\t", model_entropy, "\n\n", sep = "")
+      
+    } else {
+      
+      cat("entropy > ", entropy,":\tTRUE\nentropy:\t", model_entropy, "\n\n", sep = "")
+      
+    }
+    
+    if (is.na(min(model_avg_post_prob))){
+      
+      cat("average posterior probabilities > ", avg_post_prob,":\tFALSE\nmin average posterior probability:\t", min(model_avg_post_prob), "\n\n", sep = "")
+      
+    } else if (min(model_avg_post_prob) < avg_post_prob){
+      
+      cat("average posterior probabilities > ", avg_post_prob, ":\tFALSE\nmin average posterior probability:\t", min(model_avg_post_prob), "\n\n", sep = "")
+      
+    } else {
+      
+      cat("average posterior probabilities > ", avg_post_prob, ":\tTRUE\nmin average posterior probability:\t", min(model_avg_post_prob), "\n\n", sep = "")
+      
+    }
+    
+    if (is.na(min(model_prop_above_avg_post_prob))){
+      
+      cat("proportion above average posterior probability > ", prop_above_avg_post_prob, ":\tFALSE\nmin proportion above average posterior probability:\t", min(model_prop_above_avg_post_prob), "\n\n", sep = "")
+      
+    } else if (min(model_prop_above_avg_post_prob) < prop_above_avg_post_prob){
+      
+      cat("proportion above average posterior probability > ", prop_above_avg_post_prob, ":\tFALSE\nmin proportion above average posterior probability:\t", min(model_prop_above_avg_post_prob), "\n\n", sep = "")
+      
+    } else {
+      
+      cat("proportion above average posterior probability > ", prop_above_avg_post_prob, ":\tTRUE\nmin proportion above average posterior probability:\t", min(model_prop_above_avg_post_prob), "\n\n", sep = "")
+      
+    }
+    
+    if (is.na(min(model_avg_post_prob)) | is.na(min(model_prop_above_avg_post_prob))){
+      
+      cat("exclude model:\t", model_name, "\n\n", sep = "")
+      cat(paste(rep("-",80), collapse= ""), "\n\n", sep = "")
+      excluded_models <- c(excluded_models, i)
+      
+    }
+    
+    else if (min(model_class_sizes) < class_size | model_entropy < entropy | min(model_avg_post_prob) < avg_post_prob | min(model_prop_above_avg_post_prob) < prop_above_avg_post_prob){
+      
+      cat("exclude model:\t", model_name, "\n\n", sep = "")
+      cat(paste(rep("-",80), collapse= ""), "\n\n", sep = "")
+      excluded_models <- c(excluded_models, i)
+      
+    } else {
+      
+      cat("select model:\t", model_name, "\n\n", sep = "")
+      cat(paste(rep("-",80), collapse= ""), "\n\n", sep = "")
+      
+    }
+    
+    
+    }
+  }
+  
+  if (length(excluded_models) > 0){
+    selected_models <- models[-excluded_models]
+  } else {
+    selected_models <- models
+  }
+  
+  cat("number of selected models:\t", length(selected_models), "\n", sep = "")
+  cat("selected models:\t\t")
+  cat(names(selected_models), sep = ", ")
+  return(selected_models)
+  
+  }
+  
+  
+
+
+```
+
+Write function to compare summary statistics of models.
+
+```{r}
+
+summary_models <- function(models){
+  
+  summary_df <- data.frame(
+    Model = character(),
+    G = integer(),
+    npm = integer(),
+    loglik = numeric(),
+    BIC = numeric(),
+    SABIC = numeric(),
+    entropy = numeric(),
+    class_percentages = character(),
+    avg_post_prob = character(),
+    prop_above_post_prob = character(),
+    stringsAsFactors = FALSE
+  )
+  
+  for (i in seq_along(models)) {
+    model <- models[[i]]
+    
+    model_name <- names(models)[i]
+    
+    capture.output(suppressMessages(suppressWarnings(summary_stats <- summarytable(model, which = c("G", "loglik", "npm", "BIC", "SABIC", "entropy", "%class")))))
+    
+    class_cols <- grep("^%class", colnames(summary_stats), value = TRUE)
+    
+    class_percentages <- paste(round(summary_stats[, class_cols], 2), collapse = ", ")
+    
+    avg_post_prob <- c()
+    
+    if (summary_stats[,"G"] > 1){
+      for (n_class in 1:summary_stats[,"G"]){
+      
+      capture.output(suppressMessages(suppressWarnings(avg_post_prob <- c(avg_post_prob,postprob(model, threshold = 0.7)[[2]][n_class, n_class]))))
+      
+      }
+      
+      capture.output(suppressMessages(suppressWarnings(prop_above_post_prob <- postprob(model, threshold = 0.7)[[3]]/100)))
+    
+    } else {
+      avg_post_prob = 1
+      prop_above_post_prob = 1
+    }
+    
+    avg_post_prob <- paste(as.character(avg_post_prob), collapse = ", ")
+    prop_above_post_prob <- paste(as.character(prop_above_post_prob), collapse = ", ")
+    
+    summary_df <- rbind(summary_df, data.frame(
+      Model = model_name,
+      G = summary_stats[,"G"],
+      npm = summary_stats[,"npm"],
+      loglik = summary_stats[,"loglik"],
+      BIC = summary_stats[,"BIC"],
+      SABIC = summary_stats[,"SABIC"],
+      entropy = summary_stats[,"entropy"],
+      class_percentages = class_percentages,
+      avg_post_prob = avg_post_prob,
+      prop_above_post_prob = prop_above_post_prob,
+      stringsAsFactors = FALSE
+    ))
+  }
+  
+  return(summary_df)
+}
+
+```
+
+
+Write function that compares models across classes and selects the best model based on Lo-Mendell-Rubin Likelihood ratio test and BIC reduction of 10 points (default).
+
+```{r}
+
+
+select_best_model_accross_classes <- function(models, BIC = -0, p_LMR_LRT = 0.05){
+  
+  best_model <- models[[1]]
+  best_model_index <- 1
+  
+  for (i in 2:length(models)){
+  
+  cat("compare", names(models)[i], "to" , names(models)[best_model_index], "\n\n")
+  
+  new_model = models[[i]]
+  
+  sample_size <- as.numeric(best_model[1])
+  
+  summary_models <- summarytable(best_model, new_model, which = c("BIC", "loglik", "npm", "G"))
+  
+  BIC_best_model <- summary_models[1,1]
+  Loglik_best_model <- summary_models[1,2]
+  number_parameters_best_model <- summary_models[1,3]
+  number_classes_best_model <- summary_models[1,4]
+  
+  BIC_new_model <- summary_models[2,1]
+  Loglik_new_model <- summary_models[2,2]
+  number_parameters_new_model <- summary_models[2,3]
+  number_classes_new_model <- summary_models[2,4]
+  
+  BIC_difference <- BIC_new_model - BIC_best_model
+  LMR_LRT <- calc_lrt(n = sample_size, null_ll= Loglik_best_model, null_param = number_parameters_best_model, null_classes = number_classes_best_model, alt_ll = Loglik_new_model, alt_param = number_parameters_new_model, alt_classes = number_classes_new_model)
+  
+  p_value_LMR_LRT <- as.numeric(LMR_LRT[4])
+  
+  cat("\nBIC difference:\t\t\t", BIC_difference, "\n\n")
+  print(LMR_LRT)
+  cat("\n\n")
+  
+  if (BIC_difference <= BIC & p_value_LMR_LRT <= p_LMR_LRT){
+    
+    cat(names(models)[i],"better than", names(models)[best_model_index], "\n\n")
+    cat(paste(rep("-",80), collapse= ""), "\n\n")
+    
+    best_model <- new_model
+    best_model_index <- i
+  } else {
+    
+    cat(names(models)[i],"not better than", names(models)[best_model_index], "\n\n")
+    cat(paste(rep("-",80), collapse= ""), "\n\n")
+    
+  }
+  
+  }
+
+  cat("best model:", names(models)[best_model_index])
+  return(best_model)
+  
+}
+
+
+```
+
+# Sex separately
+
+I want to check whether the bmi trajectories are similar in females and males. If they are similar we will use the combined trajectory models.
+
+## Female
+
+
+### 1-class
+
+
+Plot models
+
+```{r}
+#| warning: false
+
+plot_hlme_model_bmi(bmi_m1r_female)
+plot_hlme_model_bmi(bmi_m1u_female)
+
+```
+
+### 2-class
+
+
+Plot models
+
+```{r}
+#| warning: false
+
+plot_hlme_model_bmi(bmi_m2r_female)
+plot_hlme_model_bmi(bmi_m2u_female)
+
+```
+
+
+
+### 3-class
+
+
+Plot models
+
+```{r}
+#| warning: false
+
+plot_hlme_model_bmi(bmi_m3r_female)
+plot_hlme_model_bmi(bmi_m3u_female)
+
+```
+
+
+### 4-class
+
+
+Plot models
+
+```{r}
+#| warning: false
+
+plot_hlme_model_bmi(bmi_m4r_female)
+plot_hlme_model_bmi(bmi_m4u_female)
+
+```
+
+
+### 5-class
+
+
+Plot models
+
+```{r}
+#| warning: false
+
+plot_hlme_model_bmi(bmi_m5r_female)
+plot_hlme_model_bmi(bmi_m5u_female)
+
+```
+
+### 6-class
+
+
+Plot models
+
+```{r}
+#| warning: false
+
+plot_hlme_model_bmi(bmi_m6r_female)
+plot_hlme_model_bmi(bmi_m6u_female)
+
+```
+
+### 7-class
+
+
+Plot models
+
+```{r}
+#| warning: false
+
+plot_hlme_model_bmi(bmi_m7r_female)
+plot_hlme_model_bmi(bmi_m7u_female)
+
+```
+
+
+### Overall
+
+```{r}
+
+bmi_models_female <- list(
+  bmi_m1r_female = bmi_m1r_female,
+  bmi_m1u_female = bmi_m1u_female,
+  bmi_m2r_female = bmi_m2r_female,
+  bmi_m2u_female = bmi_m2u_female,
+  bmi_m3r_female = bmi_m3r_female,
+  bmi_m3u_female = bmi_m3u_female,
+  bmi_m4r_female = bmi_m4r_female,
+  bmi_m4u_female = bmi_m4u_female,
+  bmi_m5r_female = bmi_m5r_female,
+  bmi_m5u_female = bmi_m5u_female,
+  bmi_m6r_female = bmi_m6r_female,
+  bmi_m6u_female = bmi_m6u_female,
+  bmi_m7r_female = bmi_m7r_female,
+  bmi_m7u_female = bmi_m7u_female)
+
+```
+
+
+Compare models:
+
+```{r}
+#| warning: false
+
+summary_models(bmi_models_female)
+
+```
+
+
+Save gbtm models
+
+```{r}
+
+save(bmi_models_female, file = here("data", "processed", "bmi_models_female.Rdata"))
+
+```
+
+
+## Male
+
+
+### 1-class
+
+
+Plot models
+
+```{r}
+#| warning: false
+
+plot_hlme_model_bmi(bmi_m1r_male)
+plot_hlme_model_bmi(bmi_m1u_male)
+
+```
+
+### 2-class
+
+
+Plot models
+
+```{r}
+#| warning: false
+
+
+plot_hlme_model_bmi(bmi_m2r_male)
+plot_hlme_model_bmi(bmi_m2u_male)
+
+```
+
+
+
+### 3-class
+
+
+Plot models
+
+```{r}
+#| warning: false
+
+plot_hlme_model_bmi(bmi_m3r_male)
+plot_hlme_model_bmi(bmi_m3u_male)
+
+```
+
+
+### 4-class
+
+
+Plot models
+
+```{r}
+#| warning: false
+
+plot_hlme_model_bmi(bmi_m4r_male)
+plot_hlme_model_bmi(bmi_m4u_male)
+
+```
+
+
+### 5-class
+
+
+Plot models
+
+```{r}
+#| warning: false
+
+plot_hlme_model_bmi(bmi_m5r_male)
+plot_hlme_model_bmi(bmi_m5u_male)
+
+```
+
+### 6-class
+
+
+Plot models
+
+```{r}
+#| warning: false
+
+plot_hlme_model_bmi(bmi_m6r_male)
+plot_hlme_model_bmi(bmi_m6u_male)
+
+```
+
+### 7-class
+
+
+Plot models
+
+```{r}
+#| warning: false
+
+plot_hlme_model_bmi(bmi_m7r_male)
+plot_hlme_model_bmi(bmi_m7u_male)
+
+```
+
+
+### Overall
+
+```{r}
+
+bmi_models_male <- list(
+  bmi_m1r_male = bmi_m1r_male,
+  bmi_m1u_male = bmi_m1u_male,
+  bmi_m2r_male = bmi_m2r_male,
+  bmi_m2u_male = bmi_m2u_male,
+  bmi_m3r_male = bmi_m3r_male,
+  bmi_m3u_male = bmi_m3u_male,
+  bmi_m4r_male = bmi_m4r_male,
+  bmi_m4u_male = bmi_m4u_male,
+  bmi_m5r_male = bmi_m5r_male,
+  bmi_m5u_male = bmi_m5u_male,
+  bmi_m6r_male = bmi_m6r_male,
+  bmi_m6u_male = bmi_m6u_male,
+  bmi_m7r_male = bmi_m7r_male,
+  bmi_m7u_male = bmi_m7u_male)
+
+```
+
+
+Compare models:
+
+```{r}
+#| warning: false
+
+summary_models(bmi_models_male)
+
+```
+
+
+Save gbtm models
+
+```{r}
+
+save(bmi_models_male, file = here("data", "processed", "bmi_models_male.Rdata"))
+
+```
+
+
+# Ethnicity separately
+
+I want to check whether the bmi trajectories are similar in europe and south asian ethnicity. If they are similar we will combine.
+
+## Europe
+
+
+### 1-class
+
+
+Plot models
+
+```{r}
+#| warning: false
+
+plot_hlme_model_bmi(bmi_m1r_europe)
+plot_hlme_model_bmi(bmi_m1u_europe)
+
+```
+
+### 2-class
+
+
+Plot models
+
+```{r}
+#| warning: false
+
+plot_hlme_model_bmi(bmi_m2r_europe)
+plot_hlme_model_bmi(bmi_m2u_europe)
+
+```
+
+
+
+### 3-class
+
+
+Plot models
+
+```{r}
+#| warning: false
+
+plot_hlme_model_bmi(bmi_m3r_europe)
+plot_hlme_model_bmi(bmi_m3u_europe)
+
+```
+
+
+### 4-class
+
+
+Plot models
+
+```{r}
+#| warning: false
+
+plot_hlme_model_bmi(bmi_m4r_europe)
+plot_hlme_model_bmi(bmi_m4u_europe)
+
+```
+
+
+### 5-class
+
+
+Plot models
+
+```{r}
+#| warning: false
+
+plot_hlme_model_bmi(bmi_m5r_europe)
+plot_hlme_model_bmi(bmi_m5u_europe)
+
+```
+
+### 6-class
+
+
+Plot models
+
+```{r}
+#| warning: false
+
+plot_hlme_model_bmi(bmi_m6r_europe)
+plot_hlme_model_bmi(bmi_m6u_europe)
+
+```
+
+### 7-class
+
+
+Plot models
+
+```{r}
+#| warning: false
+
+plot_hlme_model_bmi(bmi_m7r_europe)
+plot_hlme_model_bmi(bmi_m7u_europe)
+
+```
+
+
+### Overall
+
+```{r}
+
+bmi_models_europe <- list(
+  bmi_m1r_europe = bmi_m1r_europe,
+  bmi_m1u_europe = bmi_m1u_europe,
+  bmi_m2r_europe = bmi_m2r_europe,
+  bmi_m2u_europe = bmi_m2u_europe,
+  bmi_m3r_europe = bmi_m3r_europe,
+  bmi_m3u_europe = bmi_m3u_europe,
+  bmi_m4r_europe = bmi_m4r_europe,
+  bmi_m4u_europe = bmi_m4u_europe,
+  bmi_m5r_europe = bmi_m5r_europe,
+  bmi_m5u_europe = bmi_m5u_europe,
+  bmi_m6r_europe = bmi_m6r_europe,
+  bmi_m6u_europe = bmi_m6u_europe,
+  bmi_m7r_europe = bmi_m7r_europe,
+  bmi_m7u_europe = bmi_m7u_europe)
+
+```
+
+
+Compare models:
+
+```{r}
+#| warning: false
+
+summary_models(bmi_models_europe)
+
+```
+
+
+Save gbtm models
+
+```{r}
+
+save(bmi_models_europe, file = here("data", "processed", "bmi_models_europe.Rdata"))
+
+```
+
+
+## Asia
+
+
+### 1-class
+
+
+Plot models
+
+```{r}
+#| warning: false
+
+plot_hlme_model_bmi(bmi_m1r_asia)
+plot_hlme_model_bmi(bmi_m1u_asia)
+
+```
+
+### 2-class
+
+
+Plot models
+
+```{r}
+#| warning: false
+
+plot_hlme_model_bmi(bmi_m2r_asia)
+plot_hlme_model_bmi(bmi_m2u_asia)
+
+```
+
+
+
+### 3-class
+
+
+Plot models
+
+```{r}
+#| warning: false
+
+plot_hlme_model_bmi(bmi_m3r_asia)
+plot_hlme_model_bmi(bmi_m3u_asia)
+
+```
+
+
+### 4-class
+
+
+Plot models
+
+```{r}
+#| warning: false
+
+plot_hlme_model_bmi(bmi_m4r_asia)
+plot_hlme_model_bmi(bmi_m4u_asia)
+
+```
+
+
+### 5-class
+
+
+Plot models
+
+```{r}
+#| warning: false
+
+plot_hlme_model_bmi(bmi_m5r_asia)
+plot_hlme_model_bmi(bmi_m5u_asia)
+
+```
+
+### 6-class
+
+
+Plot models
+
+```{r}
+#| warning: false
+
+plot_hlme_model_bmi(bmi_m6r_asia)
+plot_hlme_model_bmi(bmi_m6u_asia)
+
+```
+
+### 7-class
+
+
+Plot models
+
+```{r}
+#| warning: false
+
+plot_hlme_model_bmi(bmi_m7r_asia)
+plot_hlme_model_bmi(bmi_m7u_asia)
+
+```
+
+
+### Overall
+
+```{r}
+
+bmi_models_asia <- list(
+  bmi_m1r_asia = bmi_m1r_asia,
+  bmi_m1u_asia = bmi_m1u_asia,
+  bmi_m2r_asia = bmi_m2r_asia,
+  bmi_m2u_asia = bmi_m2u_asia,
+  bmi_m3r_asia = bmi_m3r_asia,
+  bmi_m3u_asia = bmi_m3u_asia,
+  bmi_m4r_asia = bmi_m4r_asia,
+  bmi_m4u_asia = bmi_m4u_asia,
+  bmi_m5r_asia = bmi_m5r_asia,
+  bmi_m5u_asia = bmi_m5u_asia,
+  bmi_m6r_asia = bmi_m6r_asia,
+  bmi_m6u_asia = bmi_m6u_asia,
+  bmi_m7r_asia = bmi_m7r_asia,
+  bmi_m7u_asia = bmi_m7u_asia)
+
+```
+
+
+Compare models:
+
+```{r}
+#| warning: false
+
+summary_models(bmi_models_asia)
+
+```
+
+
+Save gbtm models
+
+```{r}
+
+save(bmi_models_asia, file = here("data", "processed", "bmi_models_asia.Rdata"))
+
+```
+
+
+# Total
+
+The BMI trajectories were similar in boys, girls, europe, and south asian ethnicity.
+
+I want to find the optimal model for every number of trajectories and then the optimal model overall.
+
+
+## 1-class
+
+
+Plot models
+
+```{r}
+#| warning: false
+
+plot_hlme_model_bmi(bmi_m1r_total)
+plot_hlme_model_bmi(bmi_m1u_total)
+
+```
+
+## 2-class
+
+
+Plot models
+
+```{r}
+#| warning: false
+
+plot_hlme_model_bmi(bmi_m2r_total)
+plot_hlme_model_bmi(bmi_m2u_total)
+
+```
+
+
+
+## 3-class
+
+
+Plot models
+
+```{r}
+#| warning: false
+
+plot_hlme_model_bmi(bmi_m3r_total)
+plot_hlme_model_bmi(bmi_m3u_total)
+
+```
+
+
+## 4-class
+
+
+Plot models
+
+```{r}
+#| warning: false
+
+plot_hlme_model_bmi(bmi_m4r_total)
+plot_hlme_model_bmi(bmi_m4u_total)
+
+```
+
+
+## 5-class
+
+
+Plot models
+
+```{r}
+#| warning: false
+
+plot_hlme_model_bmi(bmi_m5r_total)
+plot_hlme_model_bmi(bmi_m5u_total)
+
+```
+
+## 6-class
+
+
+Plot models
+
+```{r}
+#| warning: false
+
+plot_hlme_model_bmi(bmi_m6r_total)
+plot_hlme_model_bmi(bmi_m6u_total)
+
+```
+
+## 7-class
+
+
+Plot models
+
+```{r}
+#| warning: false
+
+plot_hlme_model_bmi(bmi_m7r_total)
+plot_hlme_model_bmi(bmi_m7u_total)
+
+```
+
+
+## Overall
+
+```{r}
+
+bmi_models_total <- list(
+  bmi_m1r_total = bmi_m1r_total,
+  bmi_m1u_total = bmi_m1u_total,
+  bmi_m2r_total = bmi_m2r_total,
+  bmi_m2u_total = bmi_m2u_total,
+  bmi_m3r_total = bmi_m3r_total,
+  bmi_m3u_total = bmi_m3u_total,
+  bmi_m4r_total = bmi_m4r_total,
+  bmi_m4u_total = bmi_m4u_total,
+  bmi_m5r_total = bmi_m5r_total,
+  bmi_m5u_total = bmi_m5u_total,
+  bmi_m6r_total = bmi_m6r_total,
+  bmi_m6u_total = bmi_m6u_total,
+  bmi_m7r_total = bmi_m7r_total,
+  bmi_m7u_total = bmi_m7u_total)
+
+```
+
+
+Compare models:
+
+```{r}
+#| warning: false
+
+summary_models(bmi_models_total)
+
+```
+
+
+Save gbtm models
+
+```{r}
+
+save(bmi_models_total, file = here("data", "processed", "bmi_models_total.Rdata"))
+
+```
+
+
+# Model selection
+
+The BMI trajectories identified by the latent class growth mixture models looked very similar in both females, males and europe, asian ethnicity. We would therefore consider the combined (total) models. We will try to select the model based on BIC, entropy, posterior probabilities, proportion of individuals above a certain threshold posterior probability, Lo-Mendell-Rubin likelihood ratio test, and biological plausibility of the trajectories.
+
+The models with random effects do not perform as well as those without:
+- The models including random effects seem to result in trajectories that are clinically/biologically rather implausible.
+- Although the random effect models often result in lower BIC and entropy, our aim is rather to group participants in distinct BMI trajectories than to best describe the BMI in the dataset. Including a random intercept or even slope would not be in line with this aim.
+
+
+### GBTM Models
+
+Have a look at the group based trajectory models (without random effects)
+
+```{r}
+
+
+for(i in seq_along(bmi_models_total)){
+  
+  print(plot_hlme_model_bmi(bmi_models_total[[i]]))
+  
+}
+
+```
+
+The models with 2 knots seem to result in more plausible trajectories. They also have slightly better BIC and entropy.
+Therefore, we will try to select a solution from the 2 knot models.
+
+```{r}
+
+two_knot_models_total <- c(bmi_models_total[1], bmi_models_total[3], bmi_models_total[5], bmi_models_total[7], bmi_models_total[9], bmi_models_total[11], bmi_models_total[13])
+
+for(i in seq_along(two_knot_models_total)){
+  
+  print(plot_hlme_model_bmi(two_knot_models_total[[i]]))
+  
+}
+
+```
+
+All of the 7 models have biologically plausible trajectories.
+
+From previous literature we have some indications of how well models should classify participants into the different trajectories:
+- entropy >= 0.6
+- class size >= 5%
+- average posterior probability in all classes >= 0.7
+- proportion with posterior probability >= 0.7 in all classes: >= 0.5
+
+Lets have a look at these criteria in the models.
+Lets also compare the models with the Lo-Mendell-Rubin Likelihood ratio test to see which model performs the best.
+
+```{r}
+
+summary_models(two_knot_models_total)
+select_best_model_accross_classes(two_knot_models_total)
+
+```
+
+Based on the BIC and the LMR LRT every subsequent model performs better than the previous one.
+However, beginning with the 3-class solution the drop in BIC (and loglikelihood) is not that big. We will therefore consider the entropy, class percentages, posterior probabilities, proportion of participants above post prob 0.7, and the biological plausibility of the 4- to 5-class models to select the best model.
+
+The 7-class solution performs best. But based on the low class percentage in class 1 (1.3%), the lower entropy (0.611), the low proportion of participants above post prop 0.7 in class 5 (0.34) and class 6 (0.39), we will not choose the 7-class model.
+
+The 6-class model would be the next best one. But based on the lower entropy (0.638), lower posterior probabilities, and low proportion of participants above post prob 0.7 in class 3 (0.48), we will not choose the 6-class model.
+
+The 5-class model has quite good entropy (0.641). The class percentages are ok with the smallest class having 4.2% of the participants. The posterior probabilities are above 0.7 for all classes. The proportion of participants above post prob 0.7 well above 0.5 for all classes.
+
+The 4-class models has slightly lower entropy (0.631) and higher BIC and SABIC. Similar posterior probabilities as the 5-class model. The 4-class solution has very similar proportion of participants with post prob above 0.7.
+
+Based on the fact that 4-class and 5-class models seem to be inline with most criteria, but the 5-class model has better AIC, BIC, entropy, and statistically significant Lo-Mendel-Rubin Test, we will select the 5-class model based on BIC and the significant LMR LRT.
+
+
+```{r}
+#| warning: false
+
+best_model <- two_knot_models_total[[5]]
+
+plot_hlme_model_bmi(best_model)
+
+plot_hlme_observed_predicted(best_model, var.time = "age_years", data = Leicester_anthro_pseudonymized, break.times = 10)
+
+```
+
+
+Save gbtm models
+
+```{r}
+
+save(bmi_models_total, file = here("data", "processed", "bmi_models_total.Rdata"))
+
+```
+
+
+Save class membership probabilities
+
+```{r}
+
+participant_classmembership <- best_model[[17]]
+
+participant_classmembership <- participant_classmembership %>% 
+  left_join(pseudonymization_key, by = "participant_id")
+
+participant_classmembership <- participant_classmembership %>% 
+  select(serialno, class, prob1, prob2, prob3, prob4, prob5)
+
+write.csv(participant_classmembership, file = here("data", "processed", "participant_classmembership.csv"), row.names = FALSE)
+
+```
+

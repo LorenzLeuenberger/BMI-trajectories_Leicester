@@ -1,0 +1,3905 @@
+---
+title: "Data analysis of association of BMI trajectories and asthma in Leicester Respiratory Cohorts"
+author: "Lorenz Leuenberger"
+date: "`r date()`"
+title-block-banner: "#e4003c"
+format: 
+  html:
+    page-layout: full
+    toc: true
+    number-sections: false
+    code-fold: true
+    code-tools: true
+    df-print: paged
+    embed-resources: true
+---
+
+# Working environment and software
+
+## Directory
+
+The folder (Leicester_bmi-trajectories) for the analysis of Leicester Respiratory Cohort data has the following structure:
+
+-   data
+    -   raw
+    -   processed
+    -   interpolated-growth-references
+-   R-and-qmd scripts
+    -   old
+-   output
+    -   figures
+    -   tables
+-   ubelix
+    -   batch-files
+    -   input
+    -   output
+    -   r-scripts
+
+I have 6 R-Quarto files for the analysis:
+
+-   00_data-cleaning.qmd: Clean raw data from Leicester Respiratory Cohorts in two parts: i. clean anthropometric data, ii. clean other outcomes and covariates. I already code variables from the raw questionnaire data.
+-   01_data-availability.qmd: Check availability of the anthropometric data to choose inclusion and exclusion criteria.
+-   02_preparation-for-ubelix.qmd: Use inclusion and exclusion criteria and pseudonymize data.
+-   03_best-1-class-model.qmd: Find suitable function (polynomials, splines) to model BMI trajectories.
+-   The BMI trajectories were estimated on the high performance computing cluster of the university of Bern (ubelix). The scripts and output is saved in the ubelix folder.
+-   04_model-selection_bmi-trajectories.qmd: Selection of optimal BMI trajectory model.
+-   05_data-analysis_bmi-trajectories.qmd: Analysis and characterization of BMI trajectories, identify risk groups and risk factors
+
+## Software
+
+Load packages
+
+```{r}
+#| output: false
+#| warning: false
+
+#Libraries
+
+library(tidyverse)
+library(here)
+library(gtsummary)
+library(cowplot)
+library(unibeCols)
+library(DescTools)
+library(DataExplorer)
+library(nnet)
+library(Hmisc)
+library(lcmm)
+library(splines)
+library(mice)
+library(future)
+library(future.apply)
+library(ggnewscale)
+library(ggtext)
+library(survey)
+library(srvyr)
+library(midoc)
+library(dagitty)
+library(ggdag)
+library(cobalt)
+
+```
+
+Write function to round 0.5 and 1.5 up consistently.
+
+```{r}
+#| warning: false
+
+# function to round 0.5 and 1.5 up consistently
+
+round2 = function(x, digits) {
+  posneg = sign(x)
+  z = abs(x)*10^digits
+  z = z + 0.5 + sqrt(.Machine$double.eps)
+  z = trunc(z)
+  z = z/10^digits
+  z*posneg
+}
+
+
+
+ggtext_size <- function(base_size, ratio = 1) {
+  ratio * base_size / ggplot2::.pt
+}
+
+```
+
+Function to load BMI trajectory models
+
+```{r}
+#| output: false
+#| warning: false
+
+load_models_to_list <- function(n_class, group) {
+  
+  file_path = here("ubelix", "output", "final_splines", paste0(n_class, "-class"), group)
+  
+  rdata_files <- list.files(path = file_path, full.names = FALSE)
+  
+  temp_env <- new.env()
+  
+  for (file in rdata_files) {
+    load(file.path(file_path, file), envir = temp_env)
+  }
+  
+  models <- as.list(temp_env)
+  rm(temp_env)
+  
+  models <- models[c(paste0("bmi_m", n_class, "r_", group),
+                     paste0("bmi_m", n_class, "s_", group),
+                     paste0("bmi_m", n_class, "t_", group),
+                     paste0("bmi_m", n_class, "u_", group),
+                     paste0("bmi_m", n_class, "v_", group),
+                     paste0("bmi_m", n_class, "w_", group))]
+  
+  return(models)
+}
+
+```
+
+
+# Inclusion and exclusion criteria
+
+Inclusion:
+
+- Include all children with at least 3 BMI measurements, at least 1 during infancy (0-1) and 1 during school age (3-10).
+
+Exclusion:
+
+- Exclude outliers of BMI (recentered z-score \<-5 or \>5)
+
+## Figure 1: Flow diagram of inclusion criteria
+
+Figure S1 was created in Word.
+
+## eTable 1: Data collection in LRC
+
+eTable 1 was created in Word. Adapted from Kuehni et al.
+
+# Data preparation
+
+## Import data
+
+```{r}
+#| output: false
+#| warning: false
+
+C1_outcomes_covariates <- read.csv(here("data", "processed", "C1_outcomes_covariates.csv"))
+C2_outcomes_covariates <- read.csv(here("data", "processed", "C2_outcomes_covariates.csv"))
+C3_outcomes_covariates <- read.csv(here("data", "processed", "C3_outcomes_covariates.csv"))
+
+Leicester_anthro_18 <- read_csv(here("data", "processed", "Leicester_anthro_18.csv"))
+
+participant_classmembership <- read_csv(here("data", "processed", "participant_classmembership.csv"))
+load(here("data", "processed", "bmi_models_total.Rdata"))
+load(here("data", "processed", "bmi_models_female.Rdata"))
+load(here("data", "processed", "bmi_models_male.Rdata"))
+load(here("data", "processed", "bmi_models_europe.Rdata"))
+load(here("data", "processed", "bmi_models_asia.Rdata"))
+
+interpolated_ukwho_bmi <- read.csv(here("data", "interpolated-growth-references", "interpolated_ukwho_bmi.csv"))
+
+```
+
+
+## Clean growth reference data
+
+Clean growth reference data:
+
+```{r}
+#| warning: false
+
+z_score_overweight <- qnorm(0.91)
+z_score_obesity <- qnorm(0.98)
+z_score_underweight <- qnorm(0.02)
+
+data_bmi_reference <- interpolated_ukwho_bmi %>%
+  filter(age_days <= 6574) %>% 
+  select(age_days, sex, M, L, S) %>% 
+  pivot_wider(id_cols = "age_days", names_from = "sex", values_from = c("M", "L", "S")) %>% 
+  mutate(cutoff_overweight_f = M_f * (1 + L_f * S_f * z_score_overweight)^(1 / L_f),
+         cutoff_obesity_f = M_f * (1 + L_f * S_f * z_score_obesity)^(1 / L_f),
+         cutoff_underweight_f = M_f * (1 + L_f * S_f * z_score_underweight)^(1 / L_f),
+         cutoff_overweight_m = M_m * (1 + L_m * S_m * z_score_overweight)^(1 / L_m),
+         cutoff_obesity_m = M_m * (1 + L_m * S_m * z_score_obesity)^(1 / L_m),
+         cutoff_underweight_m = M_m * (1 + L_m * S_m * z_score_underweight)^(1 / L_m),
+         lower_overweight_who = (cutoff_overweight_f+cutoff_overweight_m)/2,
+         lower_obesity_who = (cutoff_obesity_f+cutoff_obesity_m)/2,
+         lower_underweight_who = -Inf,
+         upper_overweight_who = lower_obesity_who,
+         upper_obesity_who = Inf,
+         upper_underweight_who = (cutoff_underweight_f+cutoff_underweight_m)/2) %>% 
+  mutate(age_years = age_days/365.25,
+         mean_who = (M_f+M_m)/2) %>% 
+  select(age_years, lower_overweight_who, lower_obesity_who, lower_underweight_who, upper_overweight_who, upper_obesity_who, upper_underweight_who, mean_who) %>% 
+  pivot_longer(
+    cols = c(lower_overweight_who, lower_obesity_who, lower_underweight_who, upper_overweight_who, upper_obesity_who, upper_underweight_who, mean_who),
+    names_to = c(".value", "class"),
+    names_sep = "_"
+  ) %>% 
+  mutate(class = case_when(class == "who" ~ "50th percentile",
+                           TRUE ~ class)) |> 
+  bind_rows(data.frame(age_years = c(0,0,0,0),
+                       class = c("underweight", "overweight", "obesity", "50th percentile"),
+                       lower = c(-Inf, 15.34684, 16.35499, NA),
+                       upper = c(11.01485, 16.35499, Inf, NA),
+                       mean = c(NA, NA, NA, 13.54390)))
+
+data_bmi_reference <- data_bmi_reference |> 
+  mutate(class = factor(class, levels = c("obesity", "overweight", "50th percentile", "underweight"), labels = c("obesity", "overweight", "50th percentile", "underweight")))
+
+```
+
+## Create variables
+
+### Outcome: BMI trajectories
+
+Create factor with BMI trajectories.
+
+- Trajectory 1: Early overweight resolving
+- Trajectory 2: Persistent low BMI
+- Trajectory 3: Adolescent onset overweight
+- Trajectory 4: Stable normal BMI
+- Trajectory 5: Childhood onset Obesity
+
+```{r}
+#| warning: false
+
+participant_classmembership <- participant_classmembership %>%
+  mutate(class = factor(class, levels = c(1,2,3,4,5), labels = c("Early overweight resolving", "Persistent low BMI", "Adolescent onset overweight", "Stable normal BMI", "Childhood onset obesity")),
+         class = relevel(class, ref = 3))
+
+```
+
+
+### Exposures / Covariates
+
+#### eTable 2: Variable coding
+
+Created in Word.
+
+Clean Leicester covariates data
+
+```{r}
+#| warning: false
+
+C1_covariates <- C1_outcomes_covariates %>% 
+  select(serialno, cohort_number,
+         birth_year, sex, gestational_age, birth_weight, older_siblings, age_mother_delivery, smoking_mother_pregnancy, breast_feeding, breast_feeding_duration, day_care,
+         ethnicity_cohort, ethnicity, ethnicity_mother, ethnicity_father,
+         age_mother_education, age_father_education,
+         townsend_2001, townsend_2001_quintile, urban_rural,
+         age_questionnaire_90, age_questionnaire_92, age_questionnaire_98, age_questionnaire_03, age_questionnaire_10, age_questionnaire_12,
+         smoking_mother_90, smoking_mother_92, smoking_mother_98, smoking_mother_03, smoking_mother_10, smoking_mother_12, smoking_others_90, smoking_others_92, smoking_others_98, smoking_others_03, smoking_others_10, smoking_others_12,
+         smoking_personal_92, smoking_personal_98, smoking_personal_03, smoking_personal_10, smoking_personal_12,
+         physical_activity_hrs_per_day_90, physical_activity_hrs_per_day_92, physical_activity_hrs_per_day_98, physical_activity_vigorous_hrs_per_week_03, physical_activity_vigorous_hrs_per_week_10, physical_activity_vigorous_hrs_per_week_12,
+         fresh_fruit_per_week_03, fresh_fruit_per_week_10, vegetables_per_week_10, crisps_per_week_10, chocolate_per_week_10)
+
+C2_covariates <- C2_outcomes_covariates %>%
+  mutate(age_questionnaire_05 = case_when(is.na(age_questionnaire_children_05) ~ age_questionnaire_parents_05,
+                                          TRUE ~ age_questionnaire_children_05),
+         age_questionnaire_ML = case_when(is.na(age_questionnaire_children_ML) ~ age_questionnaire_parents_ML,
+                                          TRUE ~ age_questionnaire_children_ML)) |> 
+  select(serialno, cohort_number,
+         birth_year, sex, gestational_age, birth_weight, older_siblings, age_mother_delivery, smoking_mother_pregnancy, breast_feeding, breast_feeding_duration, day_care,
+         ethnicity_cohort, ethnicity, ethnicity_mother, ethnicity_father,
+         age_mother_education, age_father_education,
+         townsend_2001, townsend_2001_quintile, urban_rural,
+         age_questionnaire_98, age_questionnaire_01, age_questionnaire_03, age_questionnaire_05, age_questionnaire_06, age_questionnaire_ML, age_questionnaire_He1, age_questionnaire_He2, age_questionnaire_10, age_questionnaire_12,
+         smoking_mother_98, smoking_mother_01, smoking_mother_03, smoking_mother_05, smoking_mother_06, smoking_mother_ML, smoking_mother_He1, smoking_mother_He2, smoking_mother_10, smoking_mother_12, smoking_others_98, smoking_others_01, smoking_others_03, smoking_others_05, smoking_others_06, smoking_others_ML, smoking_others_He1, smoking_others_He2, smoking_others_10, smoking_others_12,
+         smoking_personal_98, smoking_personal_01, smoking_personal_05, smoking_personal_06, smoking_personal_children_ML, smoking_personal_ever_children_ML, smoking_personal_ever_3_months_children_ML, smoking_personal_ML, smoking_personal_He1, smoking_personal_ever_He1, smoking_personal_ever_3_months_He1, smoking_personal_He2, smoking_personal_ever_He2,
+         physical_activity_hrs_per_day_98, physical_activity_hrs_per_day_01, physical_activity_hrs_per_day_03, physical_activity_hrs_per_day_05, physical_activity_hrs_per_day_06, physical_activity_hrs_per_day_ML, physical_activity_vigorous_hrs_per_week_03, physical_activity_vigorous_hrs_per_week_05, physical_activity_vigorous_hrs_per_week_06, physical_activity_vigorous_hrs_per_week_ML, physical_activity_vigorous_hrs_per_week_He1, physical_activity_vigorous_hrs_per_week_He2, physical_activity_vigorous_hrs_per_week_10, physical_activity_vigorous_hrs_per_week_12,
+         fresh_fruit_per_week_01, fresh_fruit_per_week_03, fresh_fruit_per_week_05, fresh_fruit_per_week_06, fresh_fruit_per_week_He1, fresh_fruit_per_week_He2, fresh_fruit_per_week_ML, fresh_fruit_per_week_10, vegetables_per_week_10, crisps_per_week_05, crisps_per_week_06, crisps_per_week_ML, crisps_per_week_10, chocolate_per_week_05, chocolate_per_week_06, chocolate_per_week_ML, chocolate_per_week_10, diet_type_01, diet_type_03, diet_type_05, diet_type_06, diet_type_ML)
+
+C3_covariates <- C3_outcomes_covariates %>%
+  mutate(age_questionnaire_05 = case_when(is.na(age_questionnaire_children_05) ~ age_questionnaire_parents_05,
+                                          TRUE ~ age_questionnaire_children_05),
+         age_questionnaire_ML = case_when(is.na(age_questionnaire_children_ML) ~ age_questionnaire_parents_ML,
+                                          TRUE ~ age_questionnaire_children_ML)) |> 
+  select(serialno, cohort_number,
+         birth_year, sex, gestational_age, birth_weight, older_siblings, age_mother_delivery, smoking_mother_pregnancy, breast_feeding, breast_feeding_duration, day_care,
+         ethnicity_cohort, ethnicity, ethnicity_mother, ethnicity_father,
+         age_mother_education, age_father_education,
+         townsend_2001, townsend_2001_quintile, urban_rural,
+         age_questionnaire_98, age_questionnaire_99, age_questionnaire_01, age_questionnaire_03, age_questionnaire_05, age_questionnaire_06, age_questionnaire_ML, age_questionnaire_He1, age_questionnaire_He2, age_questionnaire_10, age_questionnaire_12,
+         smoking_mother_98, smoking_mother_99, smoking_mother_01, smoking_mother_03, smoking_mother_05, smoking_mother_06, smoking_mother_ML, smoking_mother_He1, smoking_mother_He2, smoking_mother_10, smoking_mother_12, smoking_others_98, smoking_others_99, smoking_others_01, smoking_others_03, smoking_others_05, smoking_others_06, smoking_others_ML, smoking_others_He1, smoking_others_He2, smoking_others_10, smoking_others_12,
+         smoking_personal_98, smoking_personal_01, smoking_personal_05, smoking_personal_06, smoking_personal_children_ML, smoking_personal_ever_children_ML, smoking_personal_ever_3_months_children_ML, smoking_personal_ML, smoking_personal_He1, smoking_personal_ever_He1, smoking_personal_ever_3_months_He1, smoking_personal_He2, smoking_personal_ever_He2, smoking_personal_ever_3_months_He2, smoking_personal_10, smoking_personal_ever_1_year_10, smoking_personal_12, smoking_personal_ever_1_year_12,
+         physical_activity_hrs_per_day_98, physical_activity_hrs_per_day_99, physical_activity_hrs_per_day_01, physical_activity_hrs_per_day_03, physical_activity_hrs_per_day_05, physical_activity_hrs_per_day_06, physical_activity_hrs_per_day_ML, physical_activity_vigorous_hrs_per_week_03, physical_activity_vigorous_hrs_per_week_05, physical_activity_vigorous_hrs_per_week_06, physical_activity_vigorous_hrs_per_week_ML, physical_activity_vigorous_hrs_per_week_He1, physical_activity_vigorous_hrs_per_week_He2, physical_activity_vigorous_hrs_per_week_10, physical_activity_vigorous_hrs_per_week_12,
+         fresh_fruit_per_week_01, fresh_fruit_per_week_03, fresh_fruit_per_week_05, fresh_fruit_per_week_06, fresh_fruit_per_week_He1, fresh_fruit_per_week_He2, fresh_fruit_per_week_ML, fresh_fruit_per_week_10, vegetables_per_week_10, crisps_per_week_05, crisps_per_week_06, crisps_per_week_ML, crisps_per_week_10, chocolate_per_week_05, chocolate_per_week_06, chocolate_per_week_ML, chocolate_per_week_10, diet_type_01, diet_type_03, diet_type_05, diet_type_06, diet_type_ML)
+
+```
+
+#### Combine cohorts
+
+Combine cohorts
+
+```{r}
+#| warning: false
+
+Leicester_covariates <- bind_rows(C1_covariates, C2_covariates, C3_covariates)
+
+Leicester_data <- Leicester_covariates %>% 
+  left_join(participant_classmembership, by = "serialno")
+
+Leicester_data <- Leicester_data |> 
+  mutate(class = factor(class,
+                        levels = c("Stable normal BMI", "Persistent low BMI", "Early overweight resolving", "Childhood onset obesity", "Adolescent onset overweight")))
+
+```
+
+#### Code variables
+
+```{r}
+#| warning: false
+
+Leicester_data <- Leicester_data |> 
+  mutate(cohort_number = factor(cohort_number),
+         cohort_number = fct_relevel(cohort_number, c("Cohort 1 (1990)", "Cohort 2 (1998a)", "Cohort 3 (1998b)")),
+         birth_year_cat = factor(case_when(birth_year < 1990 ~ "1985-1989",
+                                             TRUE ~ "1993-1997"),
+                                   levels = c("1985-1989", "1993-1997")), 
+         ethnicity = factor(ethnicity),
+         ethnicity_cohort = factor(ethnicity_cohort, levels = c("whites", "asians"), labels = c("White", "South Asian")),
+         smoking_mother_pregnancy = factor(smoking_mother_pregnancy),
+         smoking_mother_pregnancy = fct_relevel(smoking_mother_pregnancy, c("no", "yes")),
+         breast_feeding = factor(breast_feeding),
+         breast_feeding = fct_relevel(breast_feeding, c("no", "yes")),
+         breast_feeding_duration = factor(breast_feeding_duration),
+         breast_feeding_duration = fct_relevel(breast_feeding_duration, c("0 months", "<=1 month", "1-3 months", "4-6 months", ">=6 months")))
+
+Leicester_data <- Leicester_data %>% 
+  mutate(ethnic = factor(case_when(ethnicity == "European" ~ "European",
+                                   ethnicity == "Asian" ~ "Asian",
+                                   TRUE ~ "Mixed/Other")),
+         ethnic = fct_relevel(ethnic, c("European", "Asian", "Mixed/Other")))
+
+# urbanization
+
+Leicester_data <- Leicester_data |> 
+  mutate(urban_rural = factor(urban_rural, levels = c("urban", "rural")))
+
+# townsend
+
+Leicester_data <- Leicester_data |> 
+  mutate(townsend_2001_quintile = factor(townsend_2001_quintile, levels = c(1,2,3,4,5)))
+
+# education
+
+Leicester_data <- Leicester_data |> 
+  rowwise() |> 
+  mutate(age_parental_education = case_when(is.na(age_mother_education) & is.na(age_father_education) ~ NA,
+                                            TRUE ~ max(c(age_mother_education, age_father_education), na.rm = TRUE)),
+         parental_education_cat = factor(case_when(age_father_education >= 20 | age_mother_education >= 20 ~ "higher education",
+                                              age_father_education >= 17 | age_mother_education >= 17 ~ "further education",
+                                              age_father_education < 17 | age_mother_education < 17 ~ "compulsory education",
+                                              TRUE ~ NA),
+                                         levels = c("compulsory education", "further education", "higher education"))) |> 
+  ungroup()
+
+
+# sex
+
+Leicester_data <- Leicester_data |> 
+  mutate(sex = factor(sex, levels = c("male", "female")))
+
+# Birth weight
+
+Leicester_data <- Leicester_data |> 
+  mutate(low_birth_weight = case_when(is.na(birth_weight) ~ NA,
+                                      birth_weight < 2500 ~ "Low",
+                                      TRUE ~ "Normal"))|> 
+  mutate(low_birth_weight = factor(low_birth_weight, levels = c("Normal", "Low"), labels = c("Normal", "Low")))
+
+# gestational age
+
+Leicester_data <- Leicester_data |> 
+  mutate(gestational_age = case_when(gestational_age == 0 ~ NA,
+                                     TRUE ~ gestational_age)) |> 
+  mutate(term_birth = case_when(gestational_age < 37 ~ "preterm",
+                                gestational_age >= 37 ~ "term",
+                                TRUE ~ NA))
+
+Leicester_data |> 
+  select(gestational_age, term_birth) |> 
+  tbl_summary()
+
+# older siblings
+
+Leicester_data <- Leicester_data |> 
+  mutate(number_older_siblings = older_siblings,
+         older_siblings = case_when(number_older_siblings == 0 ~ "no",
+                                    number_older_siblings > 0 ~ "yes",
+                                    TRUE ~ NA),
+         birth_order = number_older_siblings + 1,
+         birth_order_cat = factor(case_when(birth_order == 1 ~ "first child",
+                                            birth_order == 2 ~ "second child",
+                                            birth_order >= 3 ~ "third or later child",
+                                            TRUE ~ NA)))
+
+#smoking mother pregnancy
+
+Leicester_data |> select(smoking_mother_pregnancy, cohort_number) |> tbl_summary(by = cohort_number)
+Leicester_data |> select(smoking_mother_pregnancy, ethnicity_cohort) |> tbl_summary(by = ethnicity_cohort)
+
+# smoking others
+
+
+Leicester_data |> select(smoking_mother_90, smoking_mother_92, smoking_mother_98, smoking_mother_99, smoking_mother_01, smoking_mother_03, smoking_mother_05, smoking_mother_06, smoking_mother_ML, smoking_mother_He1, smoking_mother_He2, smoking_mother_10, smoking_mother_12, ethnicity_cohort) |> 
+  tbl_summary(by = ethnicity_cohort,
+              type = all_dichotomous() ~ "categorical")
+
+Leicester_data |> select(smoking_others_90, smoking_others_92, smoking_others_98, smoking_others_99, smoking_others_01, smoking_others_03, smoking_others_05, smoking_others_06, smoking_others_ML, smoking_others_He1, smoking_others_He2, smoking_others_10, smoking_others_12, ethnicity_cohort) |> 
+  tbl_summary(by = ethnicity_cohort,
+              type = all_dichotomous() ~ "categorical")
+
+
+Leicester_data <- Leicester_data |> 
+  mutate(smoking_others_ever = factor(case_when(smoking_mother_90 == "yes" ~ "yes",
+                                                smoking_mother_92 == "yes" ~ "yes",
+                                                smoking_mother_98 == "yes" ~ "yes",
+                                                smoking_mother_99 == "yes" ~ "yes",
+                                                smoking_mother_01 == "yes" ~ "yes",
+                                                smoking_mother_03 == "yes" ~ "yes",
+                                                smoking_mother_05 == "yes" ~ "yes",
+                                                smoking_mother_06 == "yes" ~ "yes",
+                                                smoking_mother_ML == "yes" ~ "yes",
+                                                smoking_mother_He1 == "yes" ~ "yes",
+                                                smoking_mother_He2 == "yes" ~ "yes",
+                                                smoking_mother_10 == "yes" ~ "yes",
+                                                smoking_mother_12 == "yes" ~ "yes",
+                                                smoking_others_90 == "yes" ~ "yes",
+                                                smoking_others_92 == "yes" ~ "yes",
+                                                smoking_others_98 == "yes" ~ "yes",
+                                                smoking_others_99 == "yes" ~ "yes",
+                                                smoking_others_01 == "yes" ~ "yes",
+                                                smoking_others_03 == "yes" ~ "yes",
+                                                smoking_others_05 == "yes" ~ "yes",
+                                                smoking_others_06 == "yes" ~ "yes",
+                                                smoking_others_ML == "yes" ~ "yes",
+                                                smoking_others_He1 == "yes" ~ "yes",
+                                                smoking_others_He2 == "yes" ~ "yes",
+                                                smoking_others_10 == "yes" ~ "yes",
+                                                smoking_others_12 == "yes" ~ "yes",
+                                                smoking_mother_90 == "no" ~ "no",
+                                                smoking_mother_92 == "no" ~ "no",
+                                                smoking_mother_98 == "no" ~ "no",
+                                                smoking_mother_99 == "no" ~ "no",
+                                                smoking_mother_01 == "no" ~ "no",
+                                                smoking_mother_03 == "no" ~ "no",
+                                                smoking_mother_05 == "no" ~ "no",
+                                                smoking_mother_06 == "no" ~ "no",
+                                                smoking_mother_ML == "no" ~ "no",
+                                                smoking_mother_He1 == "no" ~ "no",
+                                                smoking_mother_He2 == "no" ~ "no",
+                                                smoking_mother_10 == "no" ~ "no",
+                                                smoking_mother_12 == "no" ~ "no",
+                                                smoking_others_90 == "no" ~ "no",
+                                                smoking_others_92 == "no" ~ "no",
+                                                smoking_others_98 == "no" ~ "no",
+                                                smoking_others_99 == "no" ~ "no",
+                                                smoking_others_01 == "no" ~ "no",
+                                                smoking_others_03 == "no" ~ "no",
+                                                smoking_others_05 == "no" ~ "no",
+                                                smoking_others_06 == "no" ~ "no",
+                                                smoking_others_ML == "no" ~ "no",
+                                                smoking_others_He1 == "no" ~ "no",
+                                                smoking_others_He2 == "no" ~ "no",
+                                                smoking_others_10 == "no" ~ "no",
+                                                smoking_others_12 == "no" ~ "no",
+                                                
+                                                TRUE ~ NA)),
+         smoking_others_ever = fct_relevel(smoking_others_ever, c("no", "yes")))
+  
+Leicester_data |> select(smoking_others_ever, ethnicity_cohort) |> 
+  tbl_summary(by = "ethnicity_cohort")
+
+
+#smoking personal
+
+Leicester_data <- Leicester_data |> 
+  mutate(smoking_personal_ever = case_when(smoking_personal_92 == "yes" ~ "yes",
+                                           smoking_personal_98 == "yes" ~ "yes",
+                                           smoking_personal_01 == "yes" ~ "yes",
+                                           smoking_personal_03 == "yes" ~ "yes",
+                                           smoking_personal_05 == "yes" ~ "yes",
+                                           smoking_personal_06 == "yes" ~ "yes",
+                                           smoking_personal_ML == "yes" ~ "yes",
+                                           smoking_personal_children_ML == "yes" ~ "yes",
+                                           smoking_personal_ever_children_ML == "yes" ~ "yes",
+                                           smoking_personal_ever_3_months_children_ML == "yes" ~ "yes",
+                                           smoking_personal_He1 == "yes" ~ "yes",
+                                           smoking_personal_ever_He1 == "yes" ~ "yes",
+                                           smoking_personal_ever_3_months_He1 == "yes" ~ "yes",
+                                           smoking_personal_He2 == "yes" ~ "yes",
+                                           smoking_personal_ever_He2 == "yes" ~ "yes",
+                                           smoking_personal_ever_3_months_He2 == "yes" ~ "yes",
+                                           smoking_personal_10 == "yes" ~ "yes",
+                                           smoking_personal_ever_1_year_10 == "yes" ~ "yes",
+                                           smoking_personal_12 == "yes" ~ "yes",
+                                           smoking_personal_ever_1_year_12 == "yes" ~ "yes",
+                                           smoking_personal_92 == "no" ~ "no",
+                                           smoking_personal_98 == "no" ~ "no",
+                                           smoking_personal_01 == "no" ~ "no",
+                                           smoking_personal_03 == "no" ~ "no",
+                                           smoking_personal_05 == "no" ~ "no",
+                                           smoking_personal_06 == "no" ~ "no",
+                                           smoking_personal_ML == "no" ~ "no",
+                                           smoking_personal_children_ML == "no" ~ "no",
+                                           smoking_personal_ever_children_ML == "no" ~ "no",
+                                           smoking_personal_ever_3_months_children_ML == "no" ~ "no",
+                                           smoking_personal_He1 == "no" ~ "no",
+                                           smoking_personal_ever_He1 == "no" ~ "no",
+                                           smoking_personal_ever_3_months_He1 == "no" ~ "no",
+                                           smoking_personal_He2 == "no" ~ "no",
+                                           smoking_personal_ever_He2 == "no" ~ "no",
+                                           smoking_personal_ever_3_months_He2 == "no" ~ "no",
+                                           smoking_personal_10 == "no" ~ "no",
+                                           smoking_personal_ever_1_year_10 == "no" ~ "no",
+                                           smoking_personal_12 == "no" ~ "no",
+                                           smoking_personal_ever_1_year_12 == "no" ~ "no",
+                                           TRUE ~ NA))
+
+Leicester_data |> select(smoking_personal_ever) |> 
+  tbl_summary(type = all_dichotomous() ~ "categorical",
+              missing_stat = "{N_miss} ({p_miss}%)")
+
+# physical activity
+
+Leicester_data |> 
+  select(serialno,
+         physical_activity_hrs_per_day_90, physical_activity_hrs_per_day_92, physical_activity_hrs_per_day_98, physical_activity_hrs_per_day_99, physical_activity_hrs_per_day_01, physical_activity_hrs_per_day_03, physical_activity_hrs_per_day_05, physical_activity_hrs_per_day_06, physical_activity_hrs_per_day_ML,
+         age_questionnaire_90, age_questionnaire_92, age_questionnaire_98, age_questionnaire_99, age_questionnaire_01, age_questionnaire_03, age_questionnaire_05, age_questionnaire_06, age_questionnaire_ML) |> 
+    pivot_longer(
+    cols = -serialno,
+    names_to = c("measure", "year"),
+    names_pattern = "(.*)_(\\d{2}|ML)",
+    values_to = "value"
+  ) %>%
+  pivot_wider(
+    names_from = measure,
+    values_from = value
+  ) |> 
+  ggplot(aes(x = age_questionnaire, y = physical_activity_hrs_per_day))+
+  geom_point()
+
+Leicester_data |> 
+  select(serialno,
+         physical_activity_vigorous_hrs_per_week_03, physical_activity_vigorous_hrs_per_week_05, physical_activity_vigorous_hrs_per_week_06, physical_activity_vigorous_hrs_per_week_ML, physical_activity_vigorous_hrs_per_week_He1, physical_activity_vigorous_hrs_per_week_He2, physical_activity_vigorous_hrs_per_week_10, physical_activity_vigorous_hrs_per_week_12,
+         age_questionnaire_03, age_questionnaire_05, age_questionnaire_06, age_questionnaire_ML, age_questionnaire_He1, age_questionnaire_He2, age_questionnaire_10, age_questionnaire_12) |>
+  pivot_longer(
+    cols = -serialno,
+    names_to = c("measure", "year"),
+    names_pattern = "(.*)_(\\d{2}|ML|He1|He2)",
+    values_to = "value"
+  ) |> 
+    pivot_wider(
+    names_from = measure,
+    values_from = value
+  ) |> 
+  ggplot(aes(x = age_questionnaire, y = physical_activity_vigorous_hrs_per_week))+
+  geom_point()
+
+
+Leicester_data <- Leicester_data |>
+  rowwise() |> 
+  mutate(mean_physical_activity_hrs_per_day_under_5 = mean(c(
+    ifelse(age_questionnaire_90 < 5, physical_activity_hrs_per_day_90, NA),
+    ifelse(age_questionnaire_92 < 5, physical_activity_hrs_per_day_92, NA),
+    ifelse(age_questionnaire_98 < 5, physical_activity_hrs_per_day_98, NA),
+    ifelse(age_questionnaire_99 < 5, physical_activity_hrs_per_day_99, NA),
+    ifelse(age_questionnaire_01 < 5, physical_activity_hrs_per_day_01, NA),
+    ifelse(age_questionnaire_03 < 5, physical_activity_hrs_per_day_03, NA),
+    ifelse(age_questionnaire_05 < 5, physical_activity_hrs_per_day_05, NA),
+    ifelse(age_questionnaire_06 < 5, physical_activity_hrs_per_day_06, NA),
+    ifelse(age_questionnaire_ML < 5, physical_activity_hrs_per_day_ML, NA)), na.rm = TRUE)) |> 
+  ungroup() |> 
+  mutate(mean_physical_activity_hrs_per_day_under_5 = case_when(mean_physical_activity_hrs_per_day_under_5 == "NaN" ~ NA,
+                                                                TRUE ~ as.numeric(mean_physical_activity_hrs_per_day_under_5))) |> 
+  mutate(physical_activity_recommended_under_5 = case_when(mean_physical_activity_hrs_per_day_under_5 < 3 ~ "not reached",
+                                                   mean_physical_activity_hrs_per_day_under_5 >= 3 ~ "reached"))
+
+
+Leicester_data |> 
+  select(mean_physical_activity_hrs_per_day_under_5, physical_activity_recommended_under_5) |> 
+  tbl_summary()
+
+Leicester_data <- Leicester_data |>
+  rowwise() |> 
+  mutate(mean_physical_activity_hrs_per_week_5_to_18 = mean(c(
+    ifelse(age_questionnaire_03 > 5 & age_questionnaire_03 <= 18, physical_activity_vigorous_hrs_per_week_03, NA),
+    ifelse(age_questionnaire_05 > 5 & age_questionnaire_05 <= 18, physical_activity_vigorous_hrs_per_week_05, NA),
+    ifelse(age_questionnaire_06 > 5 & age_questionnaire_06 <= 18, physical_activity_vigorous_hrs_per_week_06, NA),
+    ifelse(age_questionnaire_ML > 5 & age_questionnaire_ML <= 18, physical_activity_vigorous_hrs_per_week_ML, NA),
+    ifelse(age_questionnaire_He1 > 5 & age_questionnaire_He1 <= 18, physical_activity_vigorous_hrs_per_week_He1, NA),
+    ifelse(age_questionnaire_He2 > 5 & age_questionnaire_He2 <= 18, physical_activity_vigorous_hrs_per_week_He2, NA),
+    ifelse(age_questionnaire_10 > 5 & age_questionnaire_10 <= 18, physical_activity_vigorous_hrs_per_week_10, NA),
+    ifelse(age_questionnaire_12 > 5 & age_questionnaire_12 <= 18, physical_activity_vigorous_hrs_per_week_12, NA)), na.rm = TRUE)) |>
+  ungroup() |> 
+  mutate(mean_physical_activity_hrs_per_week_5_to_18 = case_when(mean_physical_activity_hrs_per_week_5_to_18 == "NaN" ~ NA,
+                                                                TRUE ~ as.numeric(mean_physical_activity_hrs_per_week_5_to_18))) |> 
+  mutate(physical_activity_recommended_5_to_18 = case_when(mean_physical_activity_hrs_per_week_5_to_18 < 7 ~ "not reached",
+                                                   mean_physical_activity_hrs_per_week_5_to_18 >= 7 ~ "reached",
+                                                   TRUE ~ NA))
+
+
+Leicester_data <- Leicester_data |> 
+  mutate(physical_activity_cat_mean = factor(case_when(mean_physical_activity_hrs_per_week_5_to_18 >= 6 ~ ">=6 hrs per week",
+                                             mean_physical_activity_hrs_per_week_5_to_18 >= 4 ~ "4-5 hrs per week",
+                                             mean_physical_activity_hrs_per_week_5_to_18 >= 2 ~ "2-3 hrs per week",
+                                             mean_physical_activity_hrs_per_week_5_to_18 < 2 ~ "0-1 hr per week"),
+                                        levels = c("0-1 hr per week", "2-3 hrs per week", "4-5 hrs per week", ">=6 hrs per week")))
+
+
+Leicester_data <- Leicester_data |> 
+  mutate(physical_activity_cat_minimal = factor(case_when(mean_physical_activity_hrs_per_week_5_to_18 >= 4 ~ ">= 4 hrs per week",
+                                                          mean_physical_activity_hrs_per_week_5_to_18 < 4 ~ "0-3 hrs per week"),
+                                                levels = c("0-3 hrs per week", ">= 4 hrs per week")))
+
+
+Leicester_data <- Leicester_data |> 
+  mutate(physical_activity_cat13_18 = factor(case_when(birth_year_cat == "1985-1989" & physical_activity_vigorous_hrs_per_week_03 >=6 ~ ">=6 hrs per week",
+                                                 birth_year_cat == "1985-1989" & physical_activity_vigorous_hrs_per_week_03 >= 4 ~ "4-5 hrs per week",
+                                                 birth_year_cat == "1985-1989" & physical_activity_vigorous_hrs_per_week_03 >= 2 ~ "2-3 hrs per week",
+                                                 birth_year_cat == "1985-1989" & physical_activity_vigorous_hrs_per_week_03 <2 ~ "0-1 hr per week",
+                                                 
+                                                 birth_year_cat == "1993-1997" & physical_activity_vigorous_hrs_per_week_10 >=6 ~ ">=6 hrs per week",
+                                                 birth_year_cat == "1993-1997" & physical_activity_vigorous_hrs_per_week_10 >= 4 ~ "4-5 hrs per week",
+                                                 birth_year_cat == "1993-1997" & physical_activity_vigorous_hrs_per_week_10 >= 2 ~ "2-3 hrs per week",
+                                                 birth_year_cat == "1993-1997" & physical_activity_vigorous_hrs_per_week_10 <2 ~ "0-1 hr per week"),
+                                       levels = c("0-1 hr per week", "2-3 hrs per week", "4-5 hrs per week", ">=6 hrs per week")))
+
+Leicester_data |> 
+  select(mean_physical_activity_hrs_per_week_5_to_18, physical_activity_recommended_5_to_18, physical_activity_cat_mean, physical_activity_cat13_18) |> 
+  tbl_summary()
+
+
+
+
+# diet
+
+Leicester_data <- Leicester_data |> 
+  mutate(diet = case_when(diet_type_01 == "Mostly English with Asian" | diet_type_03 == "Mostly English with Asian" | diet_type_05 == "Mostly English with Asian" | diet_type_06 == "Mostly English with Asian" | diet_type_ML == "Mostly English with Asian" ~ "English and Asian",
+                          (diet_type_01 == "Only English" | diet_type_03 == "Only English" | diet_type_05 == "Only English" | diet_type_06 == "Only English" | diet_type_ML == "Only English") & (diet_type_01 == "Only Asian" | diet_type_03 == "Only Asian" | diet_type_05 == "Only Asian" | diet_type_06 == "Only Asian" | diet_type_ML == "Only Asian" | diet_type_01 == "Mostly Asian" | diet_type_03 == "Mostly Asian" | diet_type_05 == "Mostly Asian" | diet_type_06 == "Mostly Asian" | diet_type_ML == "Mostly Asian") ~ "English and Asian",
+                          diet_type_01 == "Only English" | diet_type_03 == "Only English" | diet_type_05 == "Only English" | diet_type_06 == "Only English" | diet_type_ML == "Only English" ~ "English",
+                          diet_type_01 == "Only Asian" | diet_type_03 == "Only Asian" | diet_type_05 == "Only Asian" | diet_type_06 == "Only Asian" | diet_type_ML == "Only Asian" | diet_type_01 == "Mostly Asian" | diet_type_03 == "Mostly Asian" | diet_type_05 == "Mostly Asian" | diet_type_06 == "Mostly Asian" | diet_type_ML == "Mostly Asian" ~ "Asian",
+                          TRUE ~ NA),
+         diet = factor(diet, levels = c("English", "English and Asian", "Asian")))
+
+Leicester_data <- Leicester_data |> 
+  rowwise() |> 
+  mutate(mean_fresh_fruit_per_week = case_when(birth_year_cat == "1985-1989" ~ fresh_fruit_per_week_03,
+                                               birth_year_cat == "1993-1997" ~ mean(c(fresh_fruit_per_week_01, fresh_fruit_per_week_03, fresh_fruit_per_week_05, fresh_fruit_per_week_06, fresh_fruit_per_week_ML, fresh_fruit_per_week_He1, fresh_fruit_per_week_He2, fresh_fruit_per_week_10), na.rm = TRUE))) |> 
+  ungroup()
+
+Leicester_data <- Leicester_data |> 
+  mutate(fresh_fruit_cat = factor(case_when(mean_fresh_fruit_per_week >=10.5 ~ "twice per day",
+                                       mean_fresh_fruit_per_week >= 5 ~ "once daily",
+                                       mean_fresh_fruit_per_week > 1 ~ "2-4 per week",
+                                       mean_fresh_fruit_per_week <= 1 ~ "0-1 per week"),
+                                  levels = c("0-1 per week", "2-4 per week", "once daily", "twice per day")),
+         fresh_fruit_cat_mean = factor(case_when(mean_fresh_fruit_per_week >= 5 ~ "Once daily or more",
+                                                 mean_fresh_fruit_per_week < 5 ~ "less than once daily"),
+                                       levels = c("Once daily or more", "less than once daily")))
+
+
+Leicester_data |> 
+  select(mean_fresh_fruit_per_week, fresh_fruit_cat, fresh_fruit_cat_mean) |> 
+  tbl_summary()
+
+Leicester_data <- Leicester_data |> 
+  rowwise() |> 
+  mutate(mean_vegetables_per_week = mean(c(vegetables_per_week_10), na.rm = TRUE)) |> 
+  ungroup()
+
+Leicester_data <- Leicester_data |> 
+  mutate(vegetables_cat = factor(case_when(mean_vegetables_per_week >=10.5 ~ "twice per week",
+                                       mean_vegetables_per_week >= 5 ~ "once daily",
+                                       mean_vegetables_per_week > 1 ~ "2-4 per week",
+                                       mean_vegetables_per_week <= 1 ~ "0-1 per week")),
+         vegetables_cat_mean = factor(case_when(mean_vegetables_per_week >= 5 ~ "Once daily or more",
+                                                 mean_vegetables_per_week < 5 ~ "less than once daily"),
+                                       levels = c("Once daily or more", "less than once daily")))
+
+
+Leicester_data |> 
+  select(mean_vegetables_per_week, vegetables_cat, vegetables_cat_mean) |> 
+  tbl_summary()
+
+Leicester_data <- Leicester_data |> 
+  rowwise() |> 
+  mutate(mean_crisps_per_week = mean(c(crisps_per_week_05, crisps_per_week_06, crisps_per_week_ML, crisps_per_week_10), na.rm = TRUE)) |> 
+  ungroup()
+
+Leicester_data <- Leicester_data |> 
+  mutate(crisps_cat = factor(case_when(mean_crisps_per_week >=10.5 ~ "twice per week",
+                                       mean_crisps_per_week >= 5 ~ "once daily",
+                                       mean_crisps_per_week > 1 ~ "2-4 per week",
+                                       mean_crisps_per_week <= 1 ~ "0-1 per week")),
+         crisps_cat_mean = factor(case_when(mean_crisps_per_week >= 5 ~ "Once daily or more",
+                                                 mean_crisps_per_week < 5 ~ "less than once daily"),
+                                       levels = c("Once daily or more", "less than once daily")))
+
+
+Leicester_data |> 
+  select(mean_crisps_per_week, crisps_cat, crisps_cat_mean) |> 
+  tbl_summary()
+
+Leicester_data <- Leicester_data |> 
+  rowwise() |> 
+  mutate(mean_chocolate_per_week = mean(c(chocolate_per_week_05, chocolate_per_week_06, chocolate_per_week_ML, chocolate_per_week_10), na.rm = TRUE)) |> 
+  ungroup()
+
+Leicester_data <- Leicester_data |> 
+  mutate(chocolate_cat = factor(case_when(mean_chocolate_per_week >=10.5 ~ "twice per week",
+                                       mean_chocolate_per_week >= 5 ~ "once daily",
+                                       mean_chocolate_per_week > 1 ~ "2-4 per week",
+                                       mean_chocolate_per_week <= 1 ~ "0-1 per week")),
+         chocolate_cat_mean = factor(case_when(mean_chocolate_per_week >= 5 ~ "Once daily or more",
+                                                 mean_chocolate_per_week < 5 ~ "less than once daily"),
+                                       levels = c("Once daily or more", "less than once daily")))
+
+
+Leicester_data |> 
+  select(mean_chocolate_per_week, chocolate_cat, chocolate_cat_mean) |> 
+  tbl_summary()
+
+```
+
+## Inclusion/Exclusion
+
+```{r}
+
+Leicester_data <- Leicester_data |> 
+  mutate(inclusion = case_when(is.na(class) ~ "excluded",
+                               TRUE ~ "included"),
+         inclusion = factor(inclusion, levels = c( "excluded", "included")))
+
+```
+
+
+# Descriptive information
+
+## Outcome
+
+### Number of measurements per participant and by age group
+
+### eTable 5: Number of measurements per participant
+
+In hlme models of the lcmm package, participants with more BMI measurements contribute more information towards the BMI trajectories.
+Hence, I want to check the distribution of measurements per participant
+
+```{r}
+
+Leicester_anthro_18 |> 
+  count(serialno, name = "number_bmi_measurements") |> 
+  ggplot(aes(x = number_bmi_measurements)) +
+  geom_histogram()+
+  scale_x_continuous(breaks = c(3,6,9,12))+
+  theme_minimal()
+
+
+Leicester_anthro_18 |> 
+  count(serialno, name = "number_bmi_measurements") |> 
+  select(number_bmi_measurements) |> 
+  tbl_summary()
+
+Leicester_anthro_18 |> 
+  count(serialno, name = "number_bmi_measurements") |> 
+  select(number_bmi_measurements) |> 
+  tbl_summary(type = everything() ~ "categorical")
+
+```
+
+Most of the participants have 3-5 measurements. There are very few with 10 or more measurements.
+
+### eTable 6: Number of measurements by age group
+
+```{r}
+
+Leicester_anthro_18 |> 
+  mutate(age = trunc(age_years)) |> 
+  count(age, name = "number_bmi_measurements") |> 
+  mutate(sum = sum(number_bmi_measurements),
+         perc = number_bmi_measurements/sum)
+
+
+
+```
+
+Number of participants with a measurements in first months of life.
+
+```{r}
+
+Leicester_data |> 
+  filter(inclusion == "included") |> 
+  left_join(Leicester_anthro_18 |> mutate(BMI_first_months = age_days/365.25*12 < 8) |> group_by(serialno) |> arrange(desc(BMI_first_months)) |> slice(1) |> ungroup() |> select(serialno, BMI_first_months), by = "serialno") |> 
+  select(BMI_first_months) |> 
+  tbl_summary()
+
+```
+
+
+### BMI trajectories
+
+BMI Trajectories by cohort.
+
+```{r}
+#| warning: false
+
+Leicester_data %>% 
+  select(cohort_number, class) %>% 
+  tbl_summary(by = "cohort_number",
+              type = all_dichotomous() ~ "categorical") %>% 
+  add_overall()
+
+
+Leicester_data %>% 
+  filter(inclusion == "included") |> 
+  select(class) |> 
+  tbl_summary(type = all_dichotomous() ~ "categorical",
+              missing = "no")
+
+```
+
+
+## Exposures / Covariates
+
+```{r}
+#| warning: false
+
+
+plot_histogram(Leicester_data |> select(birth_year, gestational_age, birth_weight, age_mother_delivery, birth_order, age_mother_education, age_father_education, age_parental_education, townsend_2001, mean_physical_activity_hrs_per_week_5_to_18, mean_fresh_fruit_per_week))
+
+plot_bar(Leicester_data |> select(birth_year_cat, sex, ethnicity, ethnic, townsend_2001_quintile, urban_rural, parental_education_cat, birth_order_cat, breast_feeding, breast_feeding_duration, smoking_mother_pregnancy, smoking_others_ever, smoking_personal_ever, urban_rural, physical_activity_recommended_under_5, physical_activity_recommended_5_to_18, physical_activity_cat_mean, fresh_fruit_cat_mean))
+
+```
+
+Check townsend quintiles
+
+```{r}
+
+Leicester_data |> 
+  select(townsend_2001, townsend_2001_quintile) |> 
+  tbl_summary(by = townsend_2001_quintile,
+              statistic = all_continuous() ~ "{min}, {max}")
+
+```
+
+
+
+Characteristics of the study participants.
+
+```{r}
+#| warning: false
+
+Leicester_data %>% 
+  select(cohort_number, birth_year_cat, sex, ethnic, smoking_mother_pregnancy, age_mother_delivery, gestational_age, birth_weight, birth_order, birth_order_cat, breast_feeding, breast_feeding_duration, age_mother_education, age_father_education, age_parental_education, parental_education_cat, townsend_2001, townsend_2001_quintile, urban_rural, physical_activity_recommended_under_5, physical_activity_recommended_5_to_18, mean_physical_activity_hrs_per_week_5_to_18, physical_activity_cat_mean, mean_fresh_fruit_per_week, fresh_fruit_cat, smoking_others_ever, smoking_personal_ever) %>% 
+  tbl_summary(type = c(all_dichotomous() ~ "categorical",
+              all_continuous() ~ "continuous2"),
+              statistic = all_continuous() ~ "{mean} ({sd})",
+              missing = "always",
+              missing_stat = "{N_miss} ({p_miss}%)")
+
+```
+
+Comparing included vs. excluded participants.
+
+```{r}
+#| warning: false
+
+Leicester_data |> 
+  select(inclusion, cohort_number, birth_year_cat, sex, ethnic, smoking_mother_pregnancy, age_mother_delivery, gestational_age, birth_weight, birth_order, birth_order_cat, breast_feeding, breast_feeding_duration, age_mother_education, age_father_education, age_parental_education, parental_education_cat, townsend_2001, townsend_2001_quintile, urban_rural, physical_activity_recommended_under_5, physical_activity_recommended_5_to_18, mean_physical_activity_hrs_per_week_5_to_18, physical_activity_cat_mean, mean_fresh_fruit_per_week, fresh_fruit_cat, smoking_others_ever, smoking_personal_ever) |> 
+  tbl_summary(by = inclusion,
+              type = c(all_dichotomous() ~ "categorical",
+              all_continuous() ~ "continuous2"),
+              statistic = all_continuous() ~ "{mean} ({sd})",
+              missing_stat = "{N_miss} ({p_miss}%)") |> 
+  add_overall()
+
+```
+
+### Correlations of covariates
+
+```{r}
+
+Leicester_data |> 
+  select(cohort_number, class, birth_year_cat, sex, ethnicity, ethnic, smoking_mother_pregnancy, age_mother_delivery, gestational_age, birth_weight, birth_order, breast_feeding, age_mother_education, age_father_education, age_parental_education, townsend_2001, townsend_2001_quintile, urbanization_2001, urban_rural, smoking_others_ever, mean_physical_activity_hrs_per_week_5_to_18, mean_fresh_fruit_per_week) |> 
+  plot_correlation()
+
+```
+
+Ethnicity and age of mother at birth, education, sex, SES, breastfeeding, physical activity, fruits
+
+```{r}
+
+Leicester_data |> 
+  select(ethnic, birth_year_cat, sex, townsend_2001, townsend_2001_quintile, age_parental_education, smoking_mother_pregnancy, age_mother_delivery, gestational_age, birth_weight, breast_feeding, mean_physical_activity_hrs_per_week_5_to_18, mean_fresh_fruit_per_week) |> 
+  tbl_summary(by = "ethnic") |> 
+  add_overall() |> 
+  add_p()
+
+
+```
+
+
+# Check assumptions for CRA, IPW, and MI
+
+## Directed acyclic graph
+
+Draw DAG
+
+```{r}
+
+mdag_string <- 'dag {
+M_age_mother_delivery [pos="-1.886,0.232"]
+M_birth_order_cat [pos="-1.864,0.586"]
+M_birth_weight [pos="-1.249,1.422"]
+M_breast_feeding_duration [pos="-1.054,1.745"]
+M_class [pos="0.817,-1.281"]
+M_fresh_fruit_cat [pos="0.686,1.781"]
+M_gestational_age [pos="-1.479,1.214"]
+M_parental_education_cat [pos="-2.240,-0.284"]
+M_physical_activity_cat [pos="0.027,1.794"]
+M_smoking_mother_pregnancy [pos="-1.711,0.882"]
+M_smoking_others_ever [pos="-0.462,1.816"]
+age_mother_delivery [pos="-1.590,-0.003"]
+birth_order_cat [pos="-1.459,0.289"]
+birth_weight [pos="-0.993,1.250"]
+birth_year_cat [pos="-1.800,-0.206"]
+breast_feeding_duration [pos="-0.770,1.533"]
+class [outcome,pos="1.030,0.121"]
+ethnicity_cohort [exposure,pos="-2.232,-1.518"]
+fresh_fruit_cat [pos="0.943,1.440"]
+gestational_age [pos="-1.163,0.984"]
+parental_education_cat [pos="-1.990,-0.622"]
+physical_activity_cat [pos="0.020,1.382"]
+sex [pos="-1.669,-1.689"]
+smoking_mother_pregnancy [pos="-1.365,0.705"]
+smoking_others_ever [pos="-0.474,1.431"]
+townsend_2001 [pos="-2.052,-0.861"]
+urban_rural [pos="-2.133,-1.096"]
+age_mother_delivery -> birth_order_cat
+age_mother_delivery -> birth_weight
+age_mother_delivery -> breast_feeding_duration
+age_mother_delivery -> class
+age_mother_delivery -> fresh_fruit_cat
+age_mother_delivery -> gestational_age
+age_mother_delivery -> physical_activity_cat
+age_mother_delivery -> smoking_others_ever
+birth_order_cat -> birth_weight
+birth_order_cat -> breast_feeding_duration
+birth_order_cat -> class
+birth_order_cat -> fresh_fruit_cat
+birth_order_cat -> gestational_age
+birth_order_cat -> physical_activity_cat
+birth_order_cat -> smoking_others_ever
+birth_weight -> breast_feeding_duration
+birth_weight -> class
+birth_weight -> fresh_fruit_cat
+birth_weight -> physical_activity_cat
+birth_weight -> smoking_others_ever
+birth_year_cat -> M_class
+birth_year_cat -> age_mother_delivery
+birth_year_cat -> birth_order_cat
+birth_year_cat -> birth_weight
+birth_year_cat -> breast_feeding_duration
+birth_year_cat -> class
+birth_year_cat -> fresh_fruit_cat
+birth_year_cat -> gestational_age
+birth_year_cat -> physical_activity_cat
+birth_year_cat -> smoking_mother_pregnancy
+birth_year_cat -> smoking_others_ever
+breast_feeding_duration -> M_breast_feeding_duration
+breast_feeding_duration -> class
+breast_feeding_duration -> fresh_fruit_cat
+breast_feeding_duration -> physical_activity_cat
+breast_feeding_duration -> smoking_others_ever
+class -> M_class
+ethnicity_cohort -> M_age_mother_delivery
+ethnicity_cohort -> M_birth_order_cat
+ethnicity_cohort -> M_birth_weight
+ethnicity_cohort -> M_breast_feeding_duration
+ethnicity_cohort -> M_class
+ethnicity_cohort -> M_fresh_fruit_cat
+ethnicity_cohort -> M_gestational_age
+ethnicity_cohort -> M_parental_education_cat
+ethnicity_cohort -> M_physical_activity_cat
+ethnicity_cohort -> M_smoking_mother_pregnancy
+ethnicity_cohort -> M_smoking_others_ever
+ethnicity_cohort -> age_mother_delivery
+ethnicity_cohort -> birth_weight
+ethnicity_cohort -> birth_year_cat
+ethnicity_cohort -> breast_feeding_duration
+ethnicity_cohort -> class
+ethnicity_cohort -> fresh_fruit_cat
+ethnicity_cohort -> gestational_age
+ethnicity_cohort -> parental_education_cat
+ethnicity_cohort -> physical_activity_cat
+ethnicity_cohort -> smoking_mother_pregnancy
+ethnicity_cohort -> smoking_others_ever
+ethnicity_cohort -> townsend_2001
+ethnicity_cohort -> urban_rural
+fresh_fruit_cat -> M_fresh_fruit_cat
+fresh_fruit_cat -> class
+gestational_age -> birth_weight
+gestational_age -> breast_feeding_duration
+gestational_age -> class
+gestational_age -> fresh_fruit_cat
+gestational_age -> physical_activity_cat
+gestational_age -> smoking_others_ever
+parental_education_cat -> M_age_mother_delivery
+parental_education_cat -> M_birth_order_cat
+parental_education_cat -> M_birth_weight
+parental_education_cat -> M_breast_feeding_duration
+parental_education_cat -> M_class
+parental_education_cat -> M_fresh_fruit_cat
+parental_education_cat -> M_gestational_age
+parental_education_cat -> M_parental_education_cat
+parental_education_cat -> M_physical_activity_cat
+parental_education_cat -> M_smoking_mother_pregnancy
+parental_education_cat -> M_smoking_others_ever
+parental_education_cat -> age_mother_delivery
+parental_education_cat -> birth_order_cat
+parental_education_cat -> birth_weight
+parental_education_cat -> breast_feeding_duration
+parental_education_cat -> class
+parental_education_cat -> fresh_fruit_cat
+parental_education_cat -> gestational_age
+parental_education_cat -> physical_activity_cat
+parental_education_cat -> smoking_mother_pregnancy
+parental_education_cat -> smoking_others_ever
+physical_activity_cat -> M_physical_activity_cat
+physical_activity_cat -> class
+sex -> M_class
+sex -> birth_weight
+sex -> breast_feeding_duration
+sex -> class
+sex -> fresh_fruit_cat
+sex -> gestational_age
+sex -> physical_activity_cat
+sex -> smoking_others_ever
+smoking_mother_pregnancy -> M_smoking_mother_pregnancy
+smoking_mother_pregnancy -> M_smoking_others_ever
+smoking_mother_pregnancy -> birth_weight
+smoking_mother_pregnancy -> class
+smoking_mother_pregnancy -> fresh_fruit_cat
+smoking_mother_pregnancy -> gestational_age
+smoking_mother_pregnancy -> physical_activity_cat
+smoking_mother_pregnancy -> smoking_others_ever
+smoking_others_ever -> M_smoking_others_ever
+smoking_others_ever -> class
+townsend_2001 -> M_age_mother_delivery
+townsend_2001 -> M_birth_order_cat
+townsend_2001 -> M_birth_weight
+townsend_2001 -> M_breast_feeding_duration
+townsend_2001 -> M_class
+townsend_2001 -> M_fresh_fruit_cat
+townsend_2001 -> M_gestational_age
+townsend_2001 -> M_parental_education_cat
+townsend_2001 -> M_physical_activity_cat
+townsend_2001 -> M_smoking_mother_pregnancy
+townsend_2001 -> M_smoking_others_ever
+townsend_2001 -> age_mother_delivery
+townsend_2001 -> birth_order_cat
+townsend_2001 -> birth_weight
+townsend_2001 -> breast_feeding_duration
+townsend_2001 -> class
+townsend_2001 -> fresh_fruit_cat
+townsend_2001 -> gestational_age
+townsend_2001 -> parental_education_cat
+townsend_2001 -> physical_activity_cat
+townsend_2001 -> smoking_mother_pregnancy
+townsend_2001 -> smoking_others_ever
+urban_rural -> M_age_mother_delivery
+urban_rural -> M_birth_order_cat
+urban_rural -> M_birth_weight
+urban_rural -> M_breast_feeding_duration
+urban_rural -> M_class
+urban_rural -> M_fresh_fruit_cat
+urban_rural -> M_gestational_age
+urban_rural -> M_parental_education_cat
+urban_rural -> M_physical_activity_cat
+urban_rural -> M_smoking_mother_pregnancy
+urban_rural -> M_smoking_others_ever
+urban_rural -> age_mother_delivery
+urban_rural -> birth_order_cat
+urban_rural -> birth_weight
+urban_rural -> breast_feeding_duration
+urban_rural -> class
+urban_rural -> fresh_fruit_cat
+urban_rural -> gestational_age
+urban_rural -> parental_education_cat
+urban_rural -> physical_activity_cat
+urban_rural -> smoking_mother_pregnancy
+urban_rural -> smoking_others_ever
+urban_rural -> townsend_2001
+}
+
+'
+
+
+dag_obj <- dagitty(mdag_string)
+
+plot(dag_obj)
+
+
+
+```
+
+Check the missingness patterns
+
+```{r}
+
+md.pattern(Leicester_data |> 
+  select(ethnicity_cohort, urban_rural, townsend_2001, parental_education_cat, birth_year_cat, sex, birth_order_cat, smoking_mother_pregnancy, age_mother_delivery, gestational_age, birth_weight, smoking_others_ever, physical_activity_cat, fresh_fruit_cat, class))
+  
+
+```
+
+
+Check DAG with Leicester data
+
+```{r}
+
+Leicester_data_missing <- Leicester_data |> 
+  mutate(M_parental_education_cat = factor(case_when(is.na(parental_education_cat) ~ 0,
+                                              TRUE ~ 1)),
+         M_birth_order_cat = case_when(is.na(birth_order_cat) ~ 0,
+                                              TRUE ~ 1),
+         M_smoking_mother_pregnancy = case_when(is.na(smoking_mother_pregnancy) ~ 0,
+                                                TRUE ~ 1),
+         M_age_mother_delivery = factor(case_when(is.na(age_mother_delivery) ~ 0,
+                                                TRUE ~ 1)),
+         M_gestational_age = case_when(is.na(gestational_age) ~ 0,
+                                                TRUE ~ 1),
+         M_birth_weight = case_when(is.na(birth_weight) ~ 0,
+                                                TRUE ~ 1),
+         M_breast_feeding_duration = case_when(is.na(breast_feeding_duration) ~ 0,
+                                                TRUE ~ 1),
+         M_smoking_others_ever = case_when(is.na(smoking_others_ever) ~ 0,
+                                                TRUE ~ 1),
+         M_physical_activity_cat = case_when(is.na(physical_activity_cat) ~ 0,
+                                                TRUE ~ 1),
+         M_fresh_fruit_cat = case_when(is.na(fresh_fruit_cat) ~ 0,
+                                                TRUE ~ 1),
+         M_class = case_when(is.na(class) ~ 0,
+                                                TRUE ~ 1)) |> 
+  select(ethnicity_cohort, urban_rural, townsend_2001, parental_education_cat, birth_year_cat, sex, birth_order_cat, smoking_mother_pregnancy, age_mother_delivery, gestational_age, birth_weight, smoking_others_ever, physical_activity_cat, fresh_fruit_cat, class,
+         M_parental_education_cat, M_birth_order_cat, M_smoking_mother_pregnancy, M_age_mother_delivery, M_gestational_age, M_birth_weight, M_breast_feeding_duration, M_smoking_others_ever, M_physical_activity_cat, M_fresh_fruit_cat, M_class) |> 
+  as.data.frame()
+
+midoc::exploreDAG(mdag=mdag_string, data=Leicester_data_missing)
+
+
+
+```
+
+
+--> Very few of the tested independencies are actually dependent. This is probably due to the fact that in birth_year_cat 1985-1889 all participants are white.
+
+Check basic analyses with midoc
+
+```{r}
+
+mdag_string <- 'dag {
+class -> M_class
+ethnicity -> M_class
+ethnicity -> class
+ethnicity -> townsend_2001
+townsend_2001 -> M_class
+townsend_2001 -> class
+}'
+
+midoc::checkCRA(y="class", covs="townsend_2001", r_cra="M_class", mdag=mdag_string)
+
+midoc::checkMI(dep="class", preds="ethnicity townsend_2001", r_dep="M_class", mdag=mdag_string)
+
+```
+
+--> CRA is invalid because we condition on the missing outcome (complete records analysis) and the exposure (townsend_2001) affects this aswell. There is a backwards path open.
+--> MI is invalid because the missing outcome is MNAR, because the outcome itself affects it.
+
+Check analyses after IPW for complete sociodemographic factors with midoc
+
+```{r}
+
+mdag_string <- 'dag {
+class -> M_class
+ethnicity -> class
+ethnicity -> townsend_2001
+townsend_2001 -> class
+}'
+
+midoc::checkCRA(y="class", covs="townsend_2001", r_cra="M_class", mdag=mdag_string)
+
+midoc::checkMI(dep="class", preds="ethnicity townsend_2001", r_dep="M_class", mdag=mdag_string)
+
+```
+
+--> The causal OR under CRA is asymptotically unbiased because only the outcome is missing and we closed the backwards path by IPW. The beta0 is biased however (prevalence of outcome).
+--> MI is biased because the missing outcome is affected by the outcome itself.
+
+--> The causal OR under CRA is also asymptotically unbiased for exposures of interest and confounders with missingness, as long as the exposure of interest (with missingness) does not affect the missingness of the outcome.
+--> We limited this selection bias (missingness of the exposure --> missingness of the outcome) by IPW, but there is a possibility of residual selection bias, e.g. through parental education.
+
+
+We will use IPW based on sociodemographic factors to minimize the selection bias.
+CRA will be asymptotically unbiased for the case where missingness in the exposure is not linked to missingness in the outcome.
+We will not use MI because the missingness in the outcome is most probably MNAR and because several exposures have missingness that is probably also MNAR.
+
+# Weighting
+
+## Design of LRC sample
+
+It would be interesting to be representative of the pediatric and adolescent population in the UK. Unfortunately, we did only sample whites in 1990 and whites" and "south asians in 1998. Because we did not sample other ethnicities we cannot use design weights to be representative of the UK population of children. As described above for the missing outcome, this may affect the measures of the outcome (prevalence of BMI trajectory), but not the exposure ORs.
+
+## Inclusion in BMI analysis
+
+Create inverse probability weights for the included participants, to ensure the included children to the original Leicester cohort population.
+
+### eFigure 1: DAGs before and after IPW, and possible residual biases
+
+Selection bias would come from Sociodemographic factors. We use IPW to remove the connections from Sociodemographic factors to the missingness of the outcome.
+
+Because we have missingness in parental education, but think that parental education could predict the missingness in the outcome, we will use an "unkown" category to also weight for parental education.
+
+### eTable 3: Included vs. excluded
+
+```{r}
+
+Leicester_data |> select(inclusion, sex, birth_year_cat, ethnicity_cohort, parental_education_cat, urban_rural, townsend_2001, townsend_2001_quintile, birth_order_cat, smoking_mother_pregnancy, age_mother_delivery, gestational_age, birth_weight, breast_feeding_duration, smoking_others_ever, physical_activity_cat_mean, fresh_fruit_cat_mean, vegetables_cat_mean, crisps_cat_mean, chocolate_cat_mean) |> 
+  mutate(inclusion = factor(inclusion, levels = c("included",  "excluded"))) |> 
+  tbl_summary(by = "inclusion",
+              missing = "always",
+                 type = list(all_dichotomous() ~ "categorical",
+                             all_continuous() ~ "continuous2"),
+                 statistic = list(all_categorical() ~ "{n} ({p})",
+                                  "townsend_2001" ~ "{median} ({p25}, {p75})",
+                               "age_mother_delivery" ~ "{mean} ({sd})",
+                               "gestational_age" ~ "{mean} ({sd})",
+                               "birth_weight" ~ "{mean} ({sd})"),
+                 digits = list(all_categorical() ~ 0,
+                               all_continuous2() ~ 1),
+                 missing_stat = "{N_miss} ({p_miss})") |> 
+  add_overall() |> 
+  add_p(test = list("townsend_2001" ~ "wilcox.test",
+                    "age_mother_delivery" ~ "t.test",
+                    "gestational_age" ~ "t.test",
+                    "birth_weight" ~ "t.test")) |> 
+  modify_fmt_fun(
+    p.value = function(x) {
+      ifelse(
+        x < 0.0001, 
+        "<0.0001", 
+        format(round(x, 4), nsmall = 4))  # Show 4 decimal places
+    }
+  )
+
+
+```
+
+
+
+
+
+### eTable 4: IPW model
+
+```{r}
+
+Leicester_data <- Leicester_data |> 
+  mutate(parental_education_cat = case_when(is.na(parental_education_cat) ~ "unkown",
+                                            TRUE ~ parental_education_cat))
+
+Leicester_data <- Leicester_data |> 
+  mutate(birth_year_cat = factor(birth_year_cat,
+                                 levels = c("1993-1997", "1985-1989")))
+
+```
+
+```{r}
+#| warning: false
+
+incl_model <- glm(inclusion ~ ethnicity_cohort + birth_year_cat + sex + parental_education_cat + urban_rural + townsend_2001_quintile, family = binomial, data = Leicester_data)
+summary(incl_model)
+
+cbind(exp(summary(incl_model)$coef[,1]), exp(confint(incl_model)), exp(summary(incl_model)$coef[,2]))
+
+
+```
+
+
+```{r}
+
+Leicester_data_weighted <- Leicester_data |> 
+  filter(is.na(sex)==FALSE) |> 
+  mutate(p_included = predict(incl_model, type = "response")) |> 
+  mutate(p_marginal = mean(inclusion=="included")) |> 
+  mutate(ipweight_stabilized = case_when(inclusion == "included" ~ p_marginal/p_included,
+                                         inclusion == "excluded" ~ (1 - p_marginal) / (1 - p_included)))
+
+```
+
+
+Check the created weights
+
+```{r}
+
+Leicester_data_weighted |> 
+  select(ipweight_stabilized) |> 
+  tbl_summary(statistic = all_continuous() ~ "{mean} ({sd}); {median} ({p25}, {p75}) [{min}, {max}]")
+
+
+```
+
+```{r}
+
+Leicester_data <- Leicester_data |> 
+  mutate(parental_education_cat = case_when(parental_education_cat=="unkown" ~ NA,
+                                            TRUE ~ parental_education_cat))
+
+
+Leicester_data <- Leicester_data |> 
+  mutate(birth_year_cat = factor(birth_year_cat,
+                                 levels = c("1985-1989", "1993-1997")))
+
+Leicester_data_weighted <- Leicester_data_weighted |> 
+  mutate(parental_education_cat = case_when(parental_education_cat=="unkown" ~ NA,
+                                            TRUE ~ parental_education_cat))
+
+
+Leicester_data_weighted <- Leicester_data_weighted |> 
+  mutate(birth_year_cat = factor(birth_year_cat,
+                                 levels = c("1985-1989", "1993-1997")))
+
+```
+
+### Alternative Table: Included vs. excluded after weighting
+
+```{r}
+svydesign(id = ~1, data = Leicester_data_weighted, weights = ~ipweight_stabilized, strata = ~inclusion) |> 
+  as_survey() |> 
+  select(inclusion, sex, birth_year_cat, ethnicity_cohort, parental_education_cat, urban_rural, townsend_2001, townsend_2001_quintile, smoking_mother_pregnancy, age_mother_delivery, gestational_age, birth_weight, birth_order_cat, breast_feeding_duration, smoking_others_ever, physical_activity_cat_mean, fresh_fruit_cat_mean, vegetables_cat_mean, crisps_cat_mean, chocolate_cat_mean) |> 
+  tbl_svysummary(missing = "always",
+                 by = "inclusion",
+                 type = list(all_dichotomous() ~ "categorical",
+                             all_continuous() ~ "continuous2"),
+                 statistic = list(all_categorical() ~ "{n_unweighted} ({p})",
+                                  "townsend_2001" ~ "{median} [{p25}, {p75}]",
+                               "age_mother_delivery" ~ "{mean} ({sd})",
+                               "gestational_age" ~ "{mean} ({sd})",
+                               "birth_weight" ~ "{mean} ({sd})"),
+                 digits = list(everything() ~ 0),
+                 missing_stat = "{N_miss} ({p_miss})") |> 
+  add_ci(pattern = "{stat} [{ci}]",
+    style_fun = list(everything() ~ label_style_sigfig(digits = 5))) |> 
+  add_p(test = list("townsend_2001" ~ "svy.wilcox.test",
+                    "age_mother_delivery" ~ "svy.t.test",
+                    "gestational_age" ~ "svy.t.test",
+                    "birth_weight" ~ "svy.t.test")) |> 
+  modify_fmt_fun(
+    p.value = function(x) {
+      ifelse(
+        x < 0.0001, 
+        "<0.0001", 
+        format(round(x, 4), nsmall = 4))  # Show 4 decimal places
+    }
+  ) |> 
+  add_overall()
+```
+
+### eFigure 2: Love plot of standardized differences
+
+
+```{r}
+
+
+covs <- Leicester_data_weighted[, c("sex", "birth_year_cat", "ethnicity_cohort", 
+                                    "parental_education_cat", "urban_rural", 
+                                    "townsend_2001", "townsend_2001_quintile", 
+                                    "smoking_mother_pregnancy", "age_mother_delivery", 
+                                    "gestational_age", "birth_weight", "birth_order_cat", 
+                                    "breast_feeding_duration", "smoking_others_ever", 
+                                    "physical_activity_cat_mean", "fresh_fruit_cat_mean", "vegetables_cat_mean", "crisps_cat_mean", "chocolate_cat_mean")]
+
+
+# 2. Run love.plot manually mapping the pieces
+love_plot_data <- love.plot(
+  x = covs,
+  treat = Leicester_data_weighted$inclusion,
+  weights = Leicester_data_weighted$ipweight_stabilized,
+  estimand = "ATE",
+  stats = "mean.diffs",
+  drop.missing = TRUE,
+  binary = "std",
+  continuous = "std",
+  abs = TRUE,
+  thresholds = c(m = .1),
+  var.order = "unadjusted",
+  line = TRUE,
+  sample.names = c("Before IPW", "After IPW")
+)
+
+love_plot_data <- love_plot_data$data
+
+love_plot_data <- love_plot_data |> 
+  filter(!grepl("NA", var)) |> 
+  filter(var != "townsend_2001")
+
+love_plot_data <- love_plot_data |> 
+  bind_rows(love_plot_data |>
+              filter(var == "sex_female" | var == "birth_year_cat_1993-1997" | var == "ethnicity_cohort_South Asian" | var == "urban_rural_rural" | var == "smoking_mother_pregnancy_yes" | var == "smoking_others_ever_yes" | var == "fresh_fruit_cat_mean_less than once daily" |
+                       var == "vegetables_cat_mean_less than once daily" | var == "crisps_cat_mean_less than once daily" | var == "chocolate_cat_mean_less than once daily")
+            |> mutate(var = case_when(var == "sex_female" ~ "sex_male",
+                                      var == "birth_year_cat_1993-1997" ~ "birth_year_cat_1985-1989",
+                                      var == "ethnicity_cohort_South Asian" ~ "ethnicity_cohort_White",
+                                      var == "urban_rural_rural" ~ "urban_rural_urban",
+                                      var == "smoking_mother_pregnancy_yes" ~ "smoking_mother_pregnancy_no",
+                                      var == "smoking_others_ever_yes" ~ "smoking_others_ever_no",
+                                      var == "fresh_fruit_cat_mean_less than once daily" ~ "'Once daily or more'",
+                                      var == "vegetables_cat_mean_less than once daily" ~ "' Once daily or more'",
+                                      var == "crisps_cat_mean_less than once daily" ~ "'  Once daily or more'",
+                                      var == "chocolate_cat_mean_less than once daily" ~ "'   Once daily or more'")))
+
+love_plot_data <- love_plot_data |> 
+  mutate(var = case_when(var == "sex_female" ~ "Female",
+                           var == "sex_male" ~ "Male",
+                          var == "birth_year_cat_1985-1989" ~ "'1985–1989'",
+                          var == "birth_year_cat_1993-1997" ~ "'1993–1997'",
+                          var == "ethnicity_cohort_South Asian" ~ "'South Asian'",
+                          var == "ethnicity_cohort_White" ~ "White",
+                          var == "urban_rural_rural" ~ "'Suburbs and rural'",
+                          var == "urban_rural_urban" ~ "'Inner city'",
+                          var == "townsend_2001_quintile_1" ~ "'Quintile 1'",
+                          var == "townsend_2001_quintile_2" ~ "'Quintile 2'",
+                          var == "townsend_2001_quintile_3" ~ "'Quintile 3'",
+                          var == "townsend_2001_quintile_4" ~ "'Quintile 4'",
+                          var == "townsend_2001_quintile_5" ~ "'Quintile 5'",
+                          var == "parental_education_cat_compulsory education" ~ "Compulsory",
+                          var == "parental_education_cat_further education" ~ "Further",
+                          var == "parental_education_cat_higher education" ~ "Higher",
+                          var == "smoking_mother_pregnancy_yes" ~ "Yes",
+                          var == "smoking_mother_pregnancy_no" ~ "No",
+                          var == "age_mother_delivery" ~ "bold('Age of mother at birth')",
+                          var == "gestational_age" ~ "bold('Gestational age')",
+                          var == "birth_weight" ~ "bold('Birth weight')",
+                          var == "birth_order_cat_first child" ~ "'First child'",
+                          var == "birth_order_cat_second child" ~ "'Second child'",
+                          var == "birth_order_cat_third or later child" ~ "'Third or later child'",
+                          var == "breast_feeding_duration_0 months" ~ "'0 months'",
+                          var == "breast_feeding_duration_<=1 month" ~ "'≤1 month'",
+                          var == "breast_feeding_duration_1-3 months" ~ "'1–3 months'",
+                          var == "breast_feeding_duration_4-6 months" ~ "'4–6 months'",
+                          var == "breast_feeding_duration_>=6 months" ~ "'≥6 months'",
+                          var == "physical_activity_cat_mean_0-1 hr per week" ~ "'0–1 hr/week'",
+                          var == "physical_activity_cat_mean_2-3 hrs per week" ~ "'2–3 hrs/week'",
+                          var == "physical_activity_cat_mean_4-5 hrs per week" ~ "'4–5 hrs/week'",
+                          var == "physical_activity_cat_mean_>=6 hrs per week" ~ "'≥6 hrs/week'",
+                          var == "fresh_fruit_cat_mean_less than once daily" ~ "'Less than once daily'",
+                          var == "vegetables_cat_mean_less than once daily" ~ "' Less than once daily'",
+                          var == "crisps_cat_mean_less than once daily" ~ "'  Less than once daily'",
+                          var == "chocolate_cat_mean_less than once daily" ~ "'   Less than once daily'",
+                          var == "smoking_others_ever_yes" ~ "' Yes'",
+                          var == "smoking_others_ever_no" ~ "' No'",
+                          TRUE ~ var),
+         transparency = "filled")
+
+
+love_plot_variable_titles <- data.frame(var = c("bold(Sex)",
+                                                  "bold('Birth year')",
+                                                  "bold(Ethnicity)",
+                                                  "bold('Degree of urbanization')",
+                                                  "bold('Townsend index')",
+                                                  "bold('Parental education')",
+                                                  
+                                                  "bold('Birth order')",
+                                                  "bold('Smoking during pregnancy')",
+                                                  "bold(Breastfeeding)",
+                                                  
+                                                  "bold('Secondhand tobacco smoke')",
+                                                  "bold('Physical activity')",
+                                                  "bold('Fresh fruit intake')",
+                                                  "bold('Vegetable intake')",
+                                                  "bold('Crisps intake')",
+                                                  "bold('Chocolates intake')"),
+                                         stat = 0,
+                                        transparency = "transparent")
+
+
+love_plot_data <- love_plot_data |> 
+  bind_rows(love_plot_variable_titles)
+
+love_plot_data <- love_plot_data |> 
+  mutate(label = factor(var,
+                      levels = c(
+                        "bold(Sex)",
+                        "Male",
+                        "Female",
+                        "bold('Birth year')",
+                        "'1985–1989'",
+                        "'1993–1997'",
+                        "bold(Ethnicity)",
+                        "White",
+                        "'South Asian'",
+                        "bold('Degree of urbanization')",
+                        "'Inner city'",
+                        "'Suburbs and rural'",
+                        "bold('Townsend index')",
+                        "'Quintile 1'",
+                        "'Quintile 2'",
+                        "'Quintile 3'",
+                        "'Quintile 4'",
+                        "'Quintile 5'",
+                        "bold('Parental education')",
+                        "Compulsory",
+                        "Further",
+                        "Higher",
+                        "bold('Birth order')",
+                        "'First child'",
+                        "'Second child'",
+                        "'Third or later child'",
+                        "bold('Age of mother at birth')",
+                        "bold('Gestational age')",
+                        "bold('Birth weight')",
+                        "bold('Smoking during pregnancy')",
+                        "No",
+                        "Yes",
+                        "bold(Breastfeeding)",
+                        "'0 months'",
+                        "'≤1 month'",
+                        "'1–3 months'",
+                        "'4–6 months'",
+                        "'≥6 months'",
+                        "bold('Secondhand tobacco smoke')",
+                        "' No'",
+                        "' Yes'",
+                        "bold('Physical activity')",
+                        "'0–1 hr/week'",
+                        "'2–3 hrs/week'",
+                        "'4–5 hrs/week'",
+                        "'≥6 hrs/week'",
+                        "bold('Fresh fruit intake')",
+                        "'Once daily or more'",
+                        "'Less than once daily'",
+                        "bold('Vegetable intake')",
+                        "' Once daily or more'",
+                        "' Less than once daily'",
+                        "bold('Crisps intake')",
+                        "'  Once daily or more'",
+                        "'  Less than once daily'",
+                        "bold('Chocolates intake')",
+                        "'   Once daily or more'",
+                        "'   Less than once daily'")),
+         label = fct_rev(label))
+
+
+love_plot <- love_plot_data |> ggplot(aes(x = stat, y = label, colour = Sample))+
+  geom_point(aes(alpha = transparency))+
+  geom_vline(xintercept = 0.1, linewidth = 1, color = "black", linetype = "dashed")+
+  scale_x_continuous(limits = c(0, 0.3), breaks = c(0, 0.1, 0.2, 0.3))+
+  scale_y_discrete(labels = function(x) parse(text = x))+
+  scale_colour_manual(breaks = c("Before IPW", "After IPW"), values = c(unibeRed(), unibeIce(), NA))+
+  scale_alpha_manual(breaks = c("transparent", "filled"), values = c(0, 100), guide = "none")+
+  xlab("Standardized difference")+
+  theme_minimal()+
+  theme(panel.grid.major.y = element_blank(),
+        legend.title = element_blank(),
+        legend.position = "top",
+        legend.text = element_text(size = 10, face = "bold", color = "black"),
+        axis.title.y = element_blank(),
+        axis.title.x = element_text(size = 10, face = "bold", color = "black"),
+        axis.text.y = element_text(size = 8, color = "black"),
+        axis.text.x = element_text(size = 8, color = "black"))
+
+
+
+ggsave(love_plot, filename = here("output", "figures", "love_plot.svg"), device = "svg", units = "cm", bg = "white", width = 12, height = 20)  
+  
+
+```
+
+
+
+# Main analysis
+
+## Table 1: Study characteristics
+
+```{r}
+
+Leicester_data |> 
+  select(inclusion, sex, birth_year_cat, ethnicity_cohort, parental_education_cat, urban_rural, townsend_2001, townsend_2001_quintile, birth_order_cat, age_mother_delivery, smoking_mother_pregnancy, gestational_age, birth_weight, breast_feeding, smoking_others_ever, physical_activity_cat_minimal, fresh_fruit_cat_mean, vegetables_cat_mean, crisps_cat_mean, chocolate_cat_mean) |> 
+  filter(inclusion == "included") |>
+  select(-inclusion) |> 
+  tbl_summary(missing = "always",
+              by = "ethnicity_cohort",
+                 type = list(all_dichotomous() ~ "categorical",
+                             all_continuous() ~ "continuous2"),
+                 statistic = list(all_categorical() ~ "{n} ({p})",
+                                  "townsend_2001" ~ "{median} ({p25}, {p75})",
+                               "age_mother_delivery" ~ "{mean} ({sd})",
+                               "gestational_age" ~ "{mean} ({sd})",
+                               "birth_weight" ~ "{mean} ({sd})"),
+                 digits = list(all_categorical() ~ 0,
+                               all_continuous2() ~ 1),
+                 missing_stat = "{N_miss} ({p_miss})") |> 
+  add_overall() |> 
+  add_p(test = list("townsend_2001" ~ "wilcox.test",
+                    "age_mother_delivery" ~ "t.test",
+                    "gestational_age" ~ "t.test",
+                    "birth_weight" ~ "t.test")) |> 
+  modify_fmt_fun(
+    p.value = function(x) {
+      ifelse(
+        x < 0.0001, 
+        "<0.0001", 
+        format(round(x, 4), nsmall = 4))  # Show 4 decimal places
+    }
+  )
+
+
+
+```
+
+### Alternative Table: By cohort number
+
+```{r}
+
+Leicester_data |> 
+  select(inclusion, cohort_number, sex, ethnicity_cohort, parental_education_cat, urban_rural, townsend_2001, townsend_2001_quintile, smoking_mother_pregnancy, age_mother_delivery, gestational_age, term_birth, birth_weight, birth_order_cat, breast_feeding_duration, smoking_others_ever, physical_activity_cat_mean, fresh_fruit_cat_mean) |> 
+  tbl_summary(by = cohort_number,
+              type = c(all_dichotomous() ~ "categorical",
+                       all_continuous() ~ "continuous2"),
+              statistic = list(all_continuous() ~ "{median} ({p25}, {p75})",
+                               all_categorical() ~ "{n} ({p})"),
+              missing_stat = "{N_miss} ({p_miss}%)",
+              digits = everything() ~ 0)
+
+```
+
+## Present BMI Trajectories
+
+### eSupplement-Table 7: Summary of model fit
+
+Write function to compare summary statistics of models.
+
+```{r}
+#| warning: false
+
+summary_models <- function(models){
+  
+  summary_df <- data.frame(
+    Model = character(),
+    G = integer(),
+    npm = integer(),
+    loglik = numeric(),
+    BIC = numeric(),
+    SABIC = numeric(),
+    entropy = numeric(),
+    class_percentages = character(),
+    avg_post_prob = character(),
+    prop_above_post_prob = character(),
+    stringsAsFactors = FALSE
+  )
+  
+  for (i in seq_along(models)) {
+    model <- models[[i]]
+    
+    model_name <- names(models)[i]
+    
+    capture.output(suppressMessages(suppressWarnings(summary_stats <- summarytable(model, which = c("G", "loglik", "npm", "BIC", "SABIC", "entropy", "%class")))))
+    
+    class_cols <- grep("^%class", colnames(summary_stats), value = TRUE)
+    
+    class_percentages <- paste(round(summary_stats[, class_cols], 2), collapse = ", ")
+    
+    avg_post_prob <- c()
+    
+    if (summary_stats[,"G"] > 1){
+      for (n_class in 1:summary_stats[,"G"]){
+      
+      capture.output(suppressMessages(suppressWarnings(avg_post_prob <- c(avg_post_prob,postprob(model, threshold = 0.7)[[2]][n_class, n_class]))))
+      
+      }
+      
+      capture.output(suppressMessages(suppressWarnings(prop_above_post_prob <- postprob(model, threshold = 0.7)[[3]]/100)))
+    
+    } else {
+      avg_post_prob = 1
+      prop_above_post_prob = 1
+    }
+    
+    avg_post_prob <- paste(as.character(avg_post_prob), collapse = ", ")
+    prop_above_post_prob <- paste(as.character(prop_above_post_prob), collapse = ", ")
+    
+    summary_df <- rbind(summary_df, data.frame(
+      Model = model_name,
+      G = summary_stats[,"G"],
+      npm = summary_stats[,"npm"],
+      loglik = summary_stats[,"loglik"],
+      BIC = summary_stats[,"BIC"],
+      SABIC = summary_stats[,"SABIC"],
+      entropy = summary_stats[,"entropy"],
+      class_percentages = class_percentages,
+      avg_post_prob = avg_post_prob,
+      prop_above_post_prob = prop_above_post_prob,
+      stringsAsFactors = FALSE
+    ))
+  }
+  
+  return(summary_df)
+}
+
+two_knot_models_total <- c(bmi_models_total[1], bmi_models_total[3], bmi_models_total[5], bmi_models_total[7], bmi_models_total[9], bmi_models_total[11], bmi_models_total[13])
+
+summary_models(two_knot_models_total)
+
+```
+
+
+### Alternative Table: Identified trajectories and number of participants
+
+```{r}
+
+Leicester_data |> select(class, ethnicity_cohort) |> 
+  tbl_summary(by = "ethnicity_cohort") |> 
+  add_overall()
+
+```
+
+
+### Plot BMI trajectories
+
+Functions
+
+```{r}
+#| warning: false
+
+plot_hlme_model_bmi <- function(hlme_model, age = 18){
+
+num_classes <- hlme_model$ng
+num_subjects <- hlme_model$ns
+  
+data_predict <- data.frame(age_days = seq(14, trunc(age*365.25))) %>% 
+  mutate(age_years = age_days/365.25)
+
+predictions <- predictY(hlme_model, data_predict, var.time = "age_years", draws = TRUE)
+  
+data_predict <- data.frame(predictions[2], predictions[1])
+  
+if (num_classes == 1){
+  data_predict <- data_predict %>% 
+    rename("pred.Ypred_class1" = "pred.Ypred", "pred.lower.Ypred_class1" = "pred.lower.Ypred", "pred.upper.Ypred_class1" = "pred.upper.Ypred")
+  
+}
+
+rename_columns <- setNames(
+  paste0("pred.Ypred_class", 1:num_classes), 
+  paste0("mean_class", 1:num_classes)
+)
+  
+col_names <- names(data_predict)
+  
+for (i in 1:num_classes) {
+    # Adjust column names based on the pattern in your `predictions`
+    mean_col <- paste0("pred.Ypred_class", i)
+    if (mean_col %in% col_names) {
+      colnames(data_predict)[which(colnames(data_predict) == mean_col)] <- paste0("mean_class", i)
+    }
+  }
+
+for (i in 1:num_classes) {
+    lower_col <- paste0("pred.lower.Ypred_class", i)
+    upper_col <- paste0("pred.upper.Ypred_class", i)
+    
+    if (lower_col %in% col_names) {
+      colnames(data_predict)[which(colnames(data_predict) == lower_col)] <- paste0("lower_class", i)
+    }
+    
+    if (upper_col %in% col_names) {
+      colnames(data_predict)[which(colnames(data_predict) == upper_col)] <- paste0("upper_class", i)
+    }
+  }
+
+data_predict <- data_predict %>% 
+  pivot_longer(cols = -age_years,
+               names_to = c(".value", "class"),
+               names_sep = "_",
+               values_to = "value")
+
+title <- paste0(num_classes, "-class model")
+
+if (num_classes == 1){
+  color_values = unibeSaphire()
+}
+
+if (num_classes == 2){
+  color_values = c(unibeSaphire(), unibeApricot())
+}
+
+if (num_classes == 3){
+  color_values = c(unibeSaphire(), unibeIce(), unibeRed())
+}
+
+if (num_classes == 4){
+  color_values = c(unibeRed(), unibeIce(), unibeSaphire(), unibeApricot())
+}
+
+if (num_classes == 5){
+  color_values = c(unibeMustard(), unibeIce(), unibeApricot(), unibeSaphire(), unibeRed())
+}
+
+if (num_classes == 6){
+  color_values = c(unibeMint(), unibeRed(), unibeSaphire(), unibeIce(), unibeApricot(), unibeMustard())
+}
+
+if (num_classes == 7){
+  color_values = c(unibeRed(), "#E93A1F", unibeApricot(), unibeIce(), unibeMint(), unibeSaphire(), unibeMustard())
+}
+
+if (num_subjects == 2661){
+  color_values = c(unibeRed(), unibeIce(), unibeSaphire(), unibeMustard(), unibeApricot())
+}
+
+if (num_subjects == 2910){
+  color_values = c(unibeRed(), unibeIce(), unibeMustard(), unibeSaphire(), unibeApricot())
+}
+
+if (num_subjects == 3871){
+  color_values = c(unibeRed(), unibeMustard(), unibeIce(), unibeSaphire(), unibeApricot())
+}
+
+if (num_subjects == 1700){
+  color_values = c(unibeApricot(), unibeRed(), unibeSaphire(), unibeMustard(), unibeIce())
+}
+
+
+plot_bmi_trajectories <- ggplot() +
+  geom_ribbon(data = data_bmi_reference, mapping = aes(x = age_years, ymin = lower, ymax = upper, fill = class), alpha = 0.3) +
+  geom_line(data = data_bmi_reference, mapping = aes(x = age_years, y = mean, color = class), linewidth = 0.5, linetype = "dashed") +
+  scale_fill_manual(name = "UK-WHO growth charts",
+                    values = c("obesity" = "grey5",
+                               "overweight" = "grey40",
+                               "50th percentile" = "NA",
+                               "underweight" = "grey80"),
+                    labels = c("obesity" = "Obesity above 98<sup>th</sup> centile",
+                                "overweight" = "Overweight above 91<sup>st</sup> centile",
+                               "50th percentile" = "50<sup>th</sup> centile",
+                               "underweight" = "Underweight below 2<sup>nd</sup> centile"),
+                    guide = guide_legend(order = 1)) +
+  scale_color_manual(name = "UK-WHO growth charts",
+                    values = c("obesity" = "NA",
+                               "overweight" = "NA",
+                               "50th percentile" = "black",
+                               "underweight" = "NA"),
+                    labels = c("obesity" = "Obesity above 98<sup>th</sup> centile",
+                                "overweight" = "Overweight above 91<sup>st</sup> centile",
+                               "50th percentile" = "50<sup>th</sup> centile",
+                               "underweight" = "Underweight below 2<sup>nd</sup> centile"),
+                    guide = guide_legend(order = 1)) +
+  new_scale_color()+
+  new_scale_fill()+
+  geom_ribbon(data = data_predict, mapping = aes(x = age_years, ymin = lower, ymax = upper, fill = class), alpha = 0.3) +
+  geom_line(data = data_predict, aes(x = age_years, y = mean, color = class), linewidth = 0.5) +
+  scale_fill_manual(name = "Trajectories",
+                    values = color_values,
+                    guide = guide_legend(order = 2)) +
+  scale_color_manual(name = "Trajectories",
+                    values = color_values,
+                    guide = guide_legend(order = 2)) +
+  labs(x = "Age (years)",
+       y = (bquote(BMI~(kg/m^2))))+
+  scale_x_continuous(limits = c(0, 18), expand = c(0,0), breaks = c(0,5,10,15,18))+
+  scale_y_continuous(expand = c(0,0), breaks = c(10,15,20,25,30,35,40))+
+  theme_minimal()+
+  theme(axis.line = element_line(),
+        panel.grid.minor = element_blank(),
+        panel.border = element_blank(),
+        legend.position = "none",
+        axis.title = element_text(family = "Arial", size = 8),
+        axis.text = element_text(family = "Arial", size = 7),
+        plot.margin = margin(l = 0, t = 0, r = 0.5, b = 1, unit = "cm"))
+
+return(plot_bmi_trajectories)
+
+}
+```
+
+
+Plot of predicted trajectories
+
+```{r}
+#| warning: false
+
+best_model <- bmi_models_total[[9]]
+
+plot_hlme_model_bmi(best_model)
+
+```
+
+#### Alternative Figure: BMI trajectories
+
+Prepare BMI trajectory data
+
+```{r}
+
+data_predict <- data.frame(age_days = seq(0, trunc(18*365.25))) %>% 
+  mutate(age_years = age_days/365.25)
+
+predictions <- predictY(best_model, data_predict, var.time = "age_years", draws = TRUE)
+  
+data_predict <- data.frame(predictions[2], predictions[1])
+  
+
+rename_columns <- setNames(
+  paste0("pred.Ypred_class", 1:5), 
+  paste0("mean_class", 1:5)
+)
+  
+col_names <- names(data_predict)
+  
+for (i in 1:5) {
+    # Adjust column names based on the pattern in your `predictions`
+    mean_col <- paste0("pred.Ypred_class", i)
+    if (mean_col %in% col_names) {
+      colnames(data_predict)[which(colnames(data_predict) == mean_col)] <- paste0("mean_class", i)
+    }
+  }
+
+for (i in 1:5) {
+    lower_col <- paste0("pred.lower.Ypred_class", i)
+    upper_col <- paste0("pred.upper.Ypred_class", i)
+    
+    if (lower_col %in% col_names) {
+      colnames(data_predict)[which(colnames(data_predict) == lower_col)] <- paste0("lower_class", i)
+    }
+    
+    if (upper_col %in% col_names) {
+      colnames(data_predict)[which(colnames(data_predict) == upper_col)] <- paste0("upper_class", i)
+    }
+  }
+
+data_predict <- data_predict %>% 
+  pivot_longer(cols = -age_years,
+               names_to = c(".value", "class"),
+               names_sep = "_",
+               values_to = "value")
+
+data_predict <- data_predict |> 
+  mutate(class = factor(class, levels = c("class5", "class3", "class1", "class4", "class2"), labels = c("class5", "class3", "class1", "class4", "class2")))
+
+```
+
+Plot trajectories
+
+```{r}
+
+plot_bmi_trajectories <- ggplot() +
+  geom_ribbon(data = data_bmi_reference, mapping = aes(x = age_years, ymin = lower, ymax = upper, fill = class), alpha = 0.3) +
+  geom_line(data = data_bmi_reference, mapping = aes(x = age_years, y = mean, color = class), linewidth = 0.75, linetype = "dashed") +
+  scale_fill_manual(name = "UK-WHO growth charts",
+                    values = c("obesity" = "grey5",
+                               "overweight" = "grey40",
+                               "50th percentile" = "NA",
+                               "underweight" = "grey80"),
+                    labels = c("obesity" = "Obesity above 98<sup>th</sup> centile",
+                                "overweight" = "Overweight above 91<sup>st</sup> centile",
+                               "50th percentile" = "50<sup>th</sup> centile",
+                               "underweight" = "Underweight below 2<sup>nd</sup> centile"),
+                    guide = guide_legend(order = 1)) +
+  scale_color_manual(name = "UK-WHO growth charts",
+                    values = c("obesity" = "NA",
+                               "overweight" = "NA",
+                               "50th percentile" = "black",
+                               "underweight" = "NA"),
+                    labels = c("obesity" = "Obesity above 98<sup>th</sup> centile",
+                                "overweight" = "Overweight above 91<sup>st</sup> centile",
+                               "50th percentile" = "50<sup>th</sup> centile",
+                               "underweight" = "Underweight below 2<sup>nd</sup> centile"),
+                    guide = guide_legend(order = 1)) +
+  new_scale_color()+
+  new_scale_fill()+
+  geom_ribbon(data = data_predict, mapping = aes(x = age_years, ymin = lower, ymax = upper, fill = class), alpha = 0.3) +
+  geom_line(data = data_predict, aes(x = age_years, y = mean, color = class), linewidth = 0.75) +
+  scale_fill_manual(name = "Trajectories",
+                    values = c("class5" = unibeRed(),
+                               "class3" = unibeApricot(),
+                               "class1" = unibeMustard(),
+                               "class4" = unibeSaphire(),
+                               "class2" = unibeIce()),
+                    labels = c("class5" = "Childhood onset obesity",
+                               "class3" = "Adolescent onset overweight",
+                               "class1" = "Early overweight resolving",
+                               "class4" = "Stable normal BMI",
+                               "class2" = "Persistent low BMI"),
+                    guide = guide_legend(order = 2)) +
+  scale_color_manual(name = "Trajectories",
+                    values = c("class5" = unibeRed(),
+                               "class3" = unibeApricot(),
+                               "class1" = unibeMustard(),
+                               "class4" = unibeSaphire(),
+                               "class2" = unibeIce()),
+                    labels = c("class5" = "Childhood onset obesity",
+                               "class3" = "Adolescent onset overweight",
+                               "class1" = "Early overweight resolving",
+                               "class4" = "Stable normal BMI",
+                               "class2" = "Persistent low BMI"),
+                    guide = guide_legend(order = 2)) +
+  labs(x = "Age (years)",
+       y = (bquote(BMI~(kg/m^2))))+
+  scale_x_continuous(limits = c(0, 18), expand = c(0,0), breaks = c(0,5,10,15,18))+
+  scale_y_continuous(expand = c(0,0), breaks = c(15,20,25,30))+
+  theme_minimal()+
+  theme(axis.line = element_line(),
+        panel.grid.minor = element_blank(),
+        panel.border = element_blank(),
+        legend.position = "none",
+        axis.title = element_text(family = "Arial", size = 11),
+        axis.text = element_text(family = "Arial", size = 8),
+        plot.margin = margin(l = 0, t = 0, r = 0.5, b = 0, unit = "cm"))
+
+plot_bmi_trajectories
+
+ggsave(plot_bmi_trajectories, filename = here("output", "figures", "plot_bmi_trajectories.svg"), device = "svg", units = "cm", height = 15, width = 16, bg = "white")
+
+plot_legend <- ggplot() +
+  geom_ribbon(data = data_bmi_reference, mapping = aes(x = age_years, ymin = lower, ymax = upper, fill = class), alpha = 0.3) +
+  geom_line(data = data_bmi_reference, mapping = aes(x = age_years, y = mean, color = class), linewidth = 0.25, linetype = "dashed") +
+  scale_fill_manual(name = "UK-WHO growth charts",
+                    values = c("obesity" = "grey5",
+                               "overweight" = "grey40",
+                               "50th percentile" = "NA",
+                               "underweight" = "grey80"),
+                    labels = c("obesity" = "Obesity above 98<sup>th</sup> centile",
+                                "overweight" = "Overweight above 91<sup>st</sup> centile",
+                               "50th percentile" = "50<sup>th</sup> centile",
+                               "underweight" = "Underweight below 2<sup>nd</sup> centile"),
+                    guide = guide_legend(order = 1)) +
+  scale_color_manual(name = "UK-WHO growth charts",
+                    values = c("obesity" = "NA",
+                               "overweight" = "NA",
+                               "50th percentile" = "black",
+                               "underweight" = "NA"),
+                    labels = c("obesity" = "Obesity above 98<sup>th</sup> centile",
+                                "overweight" = "Overweight above 91<sup>st</sup> centile",
+                               "50th percentile" = "50<sup>th</sup> centile",
+                               "underweight" = "Underweight below 2<sup>nd</sup> centile"),
+                    guide = guide_legend(order = 1)) +
+  new_scale_color()+
+  new_scale_fill()+
+  geom_ribbon(data = data_predict, mapping = aes(x = age_years, ymin = lower, ymax = upper, fill = class), alpha = 0.3) +
+  geom_line(data = data_predict, aes(x = age_years, y = mean, color = class), linewidth = 0.5) +
+  scale_fill_manual(name = "Trajectories",
+                    values = c("class5" = unibeRed(),
+                               "class3" = unibeApricot(),
+                               "class1" = unibeMustard(),
+                               "class4" = unibeSaphire(),
+                               "class2" = unibeIce()),
+                    labels = c("class5" = "Childhood onset obesity",
+                               "class3" = "Adolescent onset overweight",
+                               "class1" = "Early overweight resolving",
+                               "class4" = "Stable normal BMI",
+                               "class2" = "Persistent low BMI"),
+                    guide = guide_legend(order = 2)) +
+  scale_color_manual(name = "Trajectories",
+                    values = c("class5" = unibeRed(),
+                               "class3" = unibeApricot(),
+                               "class1" = unibeMustard(),
+                               "class4" = unibeSaphire(),
+                               "class2" = unibeIce()),
+                    labels = c("class5" = "Childhood onset obesity",
+                               "class3" = "Adolescent onset overweight",
+                               "class1" = "Early overweight resolving",
+                               "class4" = "Stable normal BMI",
+                               "class2" = "Persistent low BMI"),
+                    guide = guide_legend(order = 2)) +
+  labs(x = "Age (years)",
+       y = (bquote(Mean~BMI~(kg/m^2))))+
+  scale_x_continuous(limits = c(14/365.25, 18), expand = c(0,0))+
+  scale_y_continuous(expand = c(0,0))+
+  theme_minimal()+
+  theme(legend.title = element_text(family = "Helvetica", face = "bold", size = 8),
+        legend.text = element_markdown(family = "Helvetica", size = 8),
+        legend.margin = margin(l = 0, t = 0, unit = "cm"),
+        legend.box.spacing = unit(0.5,"cm"),
+        legend.key.width = unit(0.5, "cm"),
+        legend.key.height = unit(0.25, "cm"))
+
+plot_legend <- get_legend(plot_legend) 
+
+plot_legend
+
+plot_bmi_trajectories_legend <- plot_grid(plot_bmi_trajectories, plot_legend, ncol=1, rel_heights = c(1, 0.5))
+
+plot_bmi_trajectories_legend
+
+ggsave(plot_bmi_trajectories_legend, filename = here("output", "figures", "plot_bmi_trajectories_legend.svg"), device = "svg", units = "cm", bg = "white", width = 16, height = 14)
+
+
+```
+
+
+#### Figure 2: Observed vs. predicted trajectories
+
+Prepare the observed data
+
+```{r}
+
+age_means <- Leicester_anthro_18 |> 
+  mutate(age_group = ntile(age_years, 10)) |> 
+  group_by(age_group) |> 
+  summarise(mean_age = mean(age_years, na.rm = TRUE), .groups = "drop")
+
+bmi_summary <- Leicester_anthro_18 |> 
+  left_join(Leicester_data |> select(serialno, class), by = "serialno") |> 
+  mutate(age_group = ntile(age_years, 10)) |> 
+  group_by(age_group, class) |> 
+  summarise(
+    mean_bmi = mean(bmi, na.rm = TRUE),
+    n = n(),
+    sd_bmi = sd(bmi, na.rm = TRUE),
+    .groups = "drop"
+  ) |> 
+  mutate(
+    se_bmi = sd_bmi / sqrt(n),
+    ci_lower = mean_bmi - qt(0.975, df = n - 1) * se_bmi,
+    ci_upper = mean_bmi + qt(0.975, df = n - 1) * se_bmi
+  )
+
+data_observed <- bmi_summary |> 
+  left_join(age_means, by = "age_group") |> 
+  mutate(class = factor(class, levels = c("Childhood onset obesity", "Adolescent onset overweight", "Early overweight resolving", "Stable normal BMI", "Persistent low BMI")))
+
+```
+
+
+```{r}
+#| warning: false
+
+plot_observed_bmi_trajectories <- ggplot() +
+    geom_ribbon(data = data_bmi_reference, mapping = aes(x = age_years, ymin = lower, ymax = upper, fill = class), alpha = 0.3) +
+  geom_line(data = data_bmi_reference, mapping = aes(x = age_years, y = mean, color = class), linewidth = 0.75, linetype = "dashed") +
+  scale_fill_manual(name = "UK-WHO growth charts",
+                    values = c("obesity" = "grey5",
+                               "overweight" = "grey40",
+                               "50th percentile" = "NA",
+                               "underweight" = "grey80"),
+                    labels = c("obesity" = "Obesity above 98<sup>th</sup> centile",
+                                "overweight" = "Overweight above 91<sup>st</sup> centile",
+                               "50th percentile" = "50<sup>th</sup> centile",
+                               "underweight" = "Underweight below 2<sup>nd</sup> centile"),
+                    guide = guide_legend(order = 1)) +
+  scale_color_manual(name = "UK-WHO growth charts",
+                    values = c("obesity" = "NA",
+                               "overweight" = "NA",
+                               "50th percentile" = "black",
+                               "underweight" = "NA"),
+                    labels = c("obesity" = "Obesity above 98<sup>th</sup> centile",
+                                "overweight" = "Overweight above 91<sup>st</sup> centile",
+                               "50th percentile" = "50<sup>th</sup> centile",
+                               "underweight" = "Underweight below 2<sup>nd</sup> centile"),
+                    guide = guide_legend(order = 1)) +
+  new_scale_color()+
+  new_scale_fill()+
+  geom_point(data = data_observed, mapping = aes(x = mean_age, y = mean_bmi, color = class))+
+  geom_errorbar(data = data_observed, mapping = aes(x = mean_age, ymin = ci_lower, ymax = ci_upper, color = class))+
+  scale_color_manual(name = "Observed BMI",
+                    values = c("Childhood onset obesity" = unibeRed(),
+                               "Adolescent onset overweight" = unibeApricot(),
+                               "Early overweight resolving" = unibeMustard(),
+                               "Stable normal BMI" = unibeSaphire(),
+                               "Persistent low BMI" = unibeIce()),
+                    labels = c("Childhood onset obesity" = "Childhood onset obesity",
+                               "Adolescent onset overweight" = "Adolescent onset overweight",
+                               "Early overweight resolving" = "Early overweight resolving",
+                               "Stalbe normal BMI" = "Stalbe normal BMI",
+                               "Persistent low BMI" = "Persistent low BMI"),
+                    guide = guide_legend(order = 2)) +
+  new_scale_color()+
+  new_scale_fill()+
+  geom_ribbon(data = data_predict, mapping = aes(x = age_years, ymin = lower, ymax = upper, fill = class), alpha = 0.3) +
+  geom_line(data = data_predict, aes(x = age_years, y = mean, color = class), linewidth = 0.75) +
+  scale_fill_manual(name = "Predicted BMI Trajectories",
+                    values = c("class5" = unibeRed(),
+                               "class3" = unibeApricot(),
+                               "class1" = unibeMustard(),
+                               "class4" = unibeSaphire(),
+                               "class2" = unibeIce()),
+                    labels = c("class5" = "Childhood onset obesity",
+                               "class3" = "Adolescent onset overweight",
+                               "class1" = "Early overweight resolving",
+                               "class4" = "Stable normal BMI",
+                               "class2" = "Persistent low BMI"),
+                    guide = guide_legend(order = 3)) +
+  scale_color_manual(name = "Predicted BMI Trajectories",
+                    values = c("class5" = unibeRed(),
+                               "class3" = unibeApricot(),
+                               "class1" = unibeMustard(),
+                               "class4" = unibeSaphire(),
+                               "class2" = unibeIce()),
+                    labels = c("class5" = "Childhood onset obesity",
+                               "class3" = "Adolescent onset overweight",
+                               "class1" = "Early overweight resolving",
+                               "class4" = "Stable normal BMI",
+                               "class2" = "Persistent low BMI"),
+                    guide = guide_legend(order = 3)) +
+  labs(x = "Age (years)",
+       y = (bquote(BMI~(kg/m^2))))+
+  scale_x_continuous(limits = c(0, 18), expand = c(0,0), breaks = c(0,5,10,15,18))+
+  scale_y_continuous(limits = c(12, 31), expand = c(0,0), breaks = c(15,20,25,30))+
+  theme_minimal()+
+  theme(axis.line = element_line(),
+        panel.grid.minor = element_blank(),
+        panel.border = element_blank(),
+        legend.position = "none",
+        axis.title = element_text(family = "Arial", size = 11),
+        axis.text = element_text(family = "Arial", size = 8),
+        plot.margin = margin(l = 0, t = 1, r = 0.5, b = 1, unit = "cm"))
+
+plot_observed_bmi_trajectories
+
+ggsave(plot_observed_bmi_trajectories, filename = here("output", "figures", "plot_observed_bmi_trajectories.svg"), device = "svg", units = "cm", height = 15, width = 16, bg = "white")
+
+plot_legend_observed <- ggplot() +
+  geom_ribbon(data = data_bmi_reference, mapping = aes(x = age_years, ymin = lower, ymax = upper, fill = class), alpha = 0.3) +
+  geom_line(data = data_bmi_reference, mapping = aes(x = age_years, y = mean, color = class), linewidth = 0.25, linetype = "dashed") +
+  scale_fill_manual(name = "UK-WHO growth charts",
+                    values = c("obesity" = "grey5",
+                               "overweight" = "grey40",
+                               "50th percentile" = "NA",
+                               "underweight" = "grey80"),
+                    labels = c("obesity" = "Obesity above 98<sup>th</sup> centile",
+                                "overweight" = "Overweight above 91<sup>st</sup> centile",
+                               "50th percentile" = "50<sup>th</sup> centile",
+                               "underweight" = "Underweight below 2<sup>nd</sup> centile"),
+                    guide = guide_legend(order = 1)) +
+  scale_color_manual(name = "UK-WHO growth charts",
+                    values = c("obesity" = "NA",
+                               "overweight" = "NA",
+                               "50th percentile" = "black",
+                               "underweight" = "NA"),
+                    labels = c("obesity" = "Obesity above 98<sup>th</sup> centile",
+                                "overweight" = "Overweight above 91<sup>st</sup> centile",
+                               "50th percentile" = "50<sup>th</sup> centile",
+                               "underweight" = "Underweight below 2<sup>nd</sup> centile"),
+                    guide = guide_legend(order = 1)) +
+  new_scale_color()+
+  new_scale_fill()+
+  geom_point(data = data_observed, mapping = aes(x = mean_age, y = mean_bmi, color = class))+
+  geom_errorbar(data = data_observed, mapping = aes(x = mean_age, ymin = ci_lower, ymax = ci_upper, color = class))+
+  scale_color_manual(name = "Observed BMI",
+                    values = c("Childhood onset obesity" = unibeRed(),
+                               "Adolescent onset overweight" = unibeApricot(),
+                               "Early overweight resolving" = unibeMustard(),
+                               "Stable normal BMI" = unibeSaphire(),
+                               "Persistent low BMI" = unibeIce()),
+                    labels = c("Childhood onset obesity" = "Childhood onset obesity",
+                               "Adolescent onset overweight" = "Adolescent onset overweight",
+                               "Early overweight resolving" = "Early overweight resolving",
+                               "Stable normal BMI" = "Stable normal BMI",
+                               "Persistent low BMI" = "Persistent low BMI"),
+                    guide = guide_legend(order = 2, nrow = 5)) +
+  new_scale_color()+
+  new_scale_fill()+
+  geom_ribbon(data = data_predict, mapping = aes(x = age_years, ymin = lower, ymax = upper, fill = class), alpha = 0.3) +
+  geom_line(data = data_predict, aes(x = age_years, y = mean, color = class), linewidth = 0.5) +
+  scale_fill_manual(name = "Predicted BMI Trajectories",
+                    values = c("class5" = unibeRed(),
+                               "class3" = unibeApricot(),
+                               "class1" = unibeMustard(),
+                               "class4" = unibeSaphire(),
+                               "class2" = unibeIce()),
+                    labels = c("class5" = "Childhood onset obesity",
+                               "class3" = "Adolescent onset overweight",
+                               "class1" = "Early overweight resolving",
+                               "class4" = "Stable normal BMI",
+                               "class2" = "Persistent low BMI"),
+                    guide = guide_legend(order = 3, nrow = 5)) +
+  scale_color_manual(name = "Predicted BMI Trajectories",
+                    values = c("class5" = unibeRed(),
+                               "class3" = unibeApricot(),
+                               "class1" = unibeMustard(),
+                               "class4" = unibeSaphire(),
+                               "class2" = unibeIce()),
+                    labels = c("class5" = "Childhood onset obesity",
+                               "class3" = "Adolescent onset overweight",
+                               "class1" = "Early overweight resolving",
+                               "class4" = "Stable normal BMI",
+                               "class2" = "Persistent low BMI"),
+                    guide = guide_legend(order = 3, nrow = 5)) +
+  labs(x = "Age (years)",
+       y = (bquote(Mean~BMI~(kg/m^2))))+
+  scale_x_continuous(limits = c(14/365.25, 18), expand = c(0,0), )+
+  scale_y_continuous(expand = c(0,0))+
+  theme_minimal()+
+  theme(legend.title = element_text(family = "Helvetica", face = "bold", size = 8),
+        legend.text = element_markdown(family = "Helvetica", size = 8),
+        legend.margin = margin(l = 0, t = 0, unit = "cm"),
+        legend.box.spacing = unit(0.5,"cm"),
+        legend.key.width = unit(0.5, "cm"),
+        legend.key.height = unit(0.25, "cm"),
+        legend.box = "horizontal")
+
+plot_legend_observed <- get_legend(plot_legend_observed) 
+
+plot_legend_observed
+
+plot_observed_bmi_trajectories_legend <- plot_grid(plot_observed_bmi_trajectories, plot_legend_observed, ncol=1, rel_heights = c(1, 0.15))
+
+plot_observed_bmi_trajectories_legend
+
+ggsave(plot_observed_bmi_trajectories_legend, filename = here("output", "figures", "plot_observed_bmi_trajectories_legend.svg"), device = "svg", units = "cm", bg = "white", width = 16, height = 14)
+  
+
+```
+
+
+
+
+#### eSupplement Figure 3: Female vs. Male / White vs. South Asian
+
+```{r}
+#| warning: false
+
+plot_females <- plot_hlme_model_bmi(bmi_models_female[[9]])
+plot_females
+
+plot_males <- plot_hlme_model_bmi(bmi_models_male[[9]])
+plot_males
+
+plot_europe <- plot_hlme_model_bmi(bmi_models_europe[[9]])
+plot_europe
+
+plot_asia <- plot_hlme_model_bmi(bmi_models_asia[[9]])
+plot_asia
+
+plot_5_class <- plot_hlme_model_bmi(bmi_models_total[[9]])
+plot_5_class
+
+plot_legend_models <- ggplot() +
+  geom_ribbon(data = data_bmi_reference, mapping = aes(x = age_years, ymin = lower, ymax = upper, fill = class), alpha = 0.3) +
+  geom_line(data = data_bmi_reference, mapping = aes(x = age_years, y = mean, color = class), linewidth = 0.25, linetype = "dashed") +
+  scale_fill_manual(name = "UK-WHO growth charts",
+                    values = c("obesity" = "grey5",
+                               "overweight" = "grey40",
+                               "50th percentile" = "NA",
+                               "underweight" = "grey80"),
+                    labels = c("obesity" = "Obesity above 98<sup>th</sup> centile",
+                                "overweight" = "Overweight above 91<sup>st</sup> centile",
+                               "50th percentile" = "50<sup>th</sup> centile",
+                               "underweight" = "Underweight below 2<sup>nd</sup> centile"),
+                    guide = guide_legend(order = 1)) +
+  scale_color_manual(name = "UK-WHO growth charts",
+                    values = c("obesity" = "NA",
+                               "overweight" = "NA",
+                               "50th percentile" = "black",
+                               "underweight" = "NA"),
+                    labels = c("obesity" = "Obesity above 98<sup>th</sup> centile",
+                                "overweight" = "Overweight above 91<sup>st</sup> centile",
+                               "50th percentile" = "50<sup>th</sup> centile",
+                               "underweight" = "Underweight below 2<sup>nd</sup> centile"),
+                    guide = guide_legend(order = 1)) +
+  theme_minimal()+
+  theme(legend.title = element_text(family = "Helvetica", face = "bold", size = 8),
+        legend.text = element_markdown(family = "Helvetica", size = 8),
+        legend.margin = margin(l = 0, t = 0, unit = "cm"),
+        legend.box.spacing = unit(0.5,"cm"),
+        legend.key.width = unit(0.5, "cm"),
+        legend.key.height = unit(0.25, "cm"))
+
+legend_models <- get_legend(plot_legend_models) 
+
+plot_female_male_european_asian <- plot_grid(plot_females, plot_males, plot_europe, plot_asia, plot_5_class, legend_models,
+                         ncol = 2,
+                         labels = c("Female ", "Male ", "White", "South Asian", "Combined", ""),
+                         label_x = c(0.12, 0.12, 0.12, 0.12, 0.12),
+                         hjust = c(0,0,0,0,0),
+                         label_size = 12) + theme(plot.margin = margin(t = 0.5, unit = "cm"))
+
+plot_female_male_european_asian
+
+ggsave(plot_female_male_european_asian, filename = here("output", "figures", "plot_female_male_european_asian.svg"), device = "svg", units = "cm", bg = "white", width = 16, height = 18)
+
+```
+
+
+
+#### eSupplement Figure 4: All 7 models
+
+```{r}
+#| warning: false
+
+plot_1_class <- plot_hlme_model_bmi(bmi_models_total[[1]])
+plot_1_class
+
+plot_2_class <- plot_hlme_model_bmi(bmi_models_total[[3]])
+plot_2_class
+
+plot_3_class <- plot_hlme_model_bmi(bmi_models_total[[5]])
+plot_3_class
+
+plot_4_class <- plot_hlme_model_bmi(bmi_models_total[[7]])
+plot_4_class
+
+plot_5_class <- plot_hlme_model_bmi(bmi_models_total[[9]])
+plot_5_class
+
+plot_6_class <- plot_hlme_model_bmi(bmi_models_total[[11]])
+plot_6_class
+
+plot_7_class <- plot_hlme_model_bmi(bmi_models_total[[13]])
+plot_7_class
+
+plot_legend_models <- ggplot() +
+  geom_ribbon(data = data_bmi_reference, mapping = aes(x = age_years, ymin = lower, ymax = upper, fill = class), alpha = 0.3) +
+  geom_line(data = data_bmi_reference, mapping = aes(x = age_years, y = mean, color = class), linewidth = 0.25, linetype = "dashed") +
+  scale_fill_manual(name = "UK-WHO growth charts",
+                    values = c("obesity" = "grey5",
+                               "overweight" = "grey40",
+                               "50th percentile" = "NA",
+                               "underweight" = "grey80"),
+                    labels = c("obesity" = "Obesity above 98<sup>th</sup> centile",
+                                "overweight" = "Overweight above 91<sup>st</sup> centile",
+                               "50th percentile" = "50<sup>th</sup> centile",
+                               "underweight" = "Underweight below 2<sup>nd</sup> centile"),
+                    guide = guide_legend(order = 1)) +
+  scale_color_manual(name = "UK-WHO growth charts",
+                    values = c("obesity" = "NA",
+                               "overweight" = "NA",
+                               "50th percentile" = "black",
+                               "underweight" = "NA"),
+                    labels = c("obesity" = "Obesity above 98<sup>th</sup> centile",
+                                "overweight" = "Overweight above 91<sup>st</sup> centile",
+                               "50th percentile" = "50<sup>th</sup> centile",
+                               "underweight" = "Underweight below 2<sup>nd</sup> centile"),
+                    guide = guide_legend(order = 1)) +
+  theme_minimal()+
+  theme(legend.title = element_text(family = "Helvetica", face = "bold", size = 8),
+        legend.text = element_markdown(family = "Helvetica", size = 8),
+        legend.margin = margin(l = 0, t = 0, unit = "cm"),
+        legend.box.spacing = unit(0.5,"cm"),
+        legend.key.width = unit(0.5, "cm"),
+        legend.key.height = unit(0.25, "cm"))
+
+legend_models <- get_legend(plot_legend_models) 
+
+plot_models <- plot_grid(plot_1_class, plot_2_class, plot_3_class, plot_4_class, plot_5_class, plot_6_class, plot_7_class, legend_models,
+                         ncol = 2,
+                         labels = c(" 1 class ", "2 classes", "3 classes", "4 classes", "5 classes", "6 classes", "7 classes", ""),
+                         label_size = 12)
+
+plot_models
+
+ggsave(plot_models, filename = here("output", "figures", "plot_models.svg"), device = "svg", units = "cm", bg = "white", width = 16, height = 23)
+
+```
+
+
+
+
+## Characterize BMI Trajectories
+
+### Table 2: Participants' characteristics across trajectories
+
+```{r}
+#| warning: false
+
+Leicester_data |> 
+  select(class, sex, birth_year_cat, ethnicity_cohort, parental_education_cat, urban_rural, townsend_2001, townsend_2001_quintile, birth_order_cat, smoking_mother_pregnancy, age_mother_delivery, gestational_age, birth_weight, breast_feeding_duration, smoking_others_ever, physical_activity_cat_mean, fresh_fruit_cat_mean, vegetables_cat_mean, crisps_cat_mean, chocolate_cat_mean) |> 
+  tbl_summary(by = class,
+              missing = "always",
+                 type = list(all_dichotomous() ~ "categorical",
+                             all_continuous() ~ "continuous2"),
+                 statistic = list(all_categorical() ~ "{n} ({p})",
+                                  "townsend_2001" ~ "{median} ({p25}, {p75})",
+                               "age_mother_delivery" ~ "{mean} ({sd})",
+                               "gestational_age" ~ "{mean} ({sd})",
+                               "birth_weight" ~ "{mean} ({sd})"),
+                 digits = list(all_categorical() ~ 0),
+                 missing_stat = "{N_miss} ({p_miss})") |> 
+  add_p(test = list("townsend_2001" ~ "kruskal.test",
+                    "age_mother_delivery" ~ "oneway.test",
+                    "gestational_age" ~ "oneway.test",
+                    "birth_weight" ~ "oneway.test")) |> 
+  modify_fmt_fun(
+    p.value = function(x) {
+      ifelse(
+        x < 0.0001, 
+        "<0.0001", 
+        format(round(x, 4), nsmall = 4))  # Show 4 decimal places
+    }
+  )
+
+
+```
+
+
+## Associated groups and factors: multinomial regression
+
+### Integrate GBTM uncertainty
+
+We cannot classify the participants with 100% certainty into the various trajectories. We take that into account by using the posterior probabilities as weights in the multinomial logistic regression.
+
+```{r}
+
+long_data <- Leicester_data_weighted |>
+  filter(is.na(class)==FALSE) |> 
+  pivot_longer(
+    cols = starts_with("prob"),
+    names_to = "latent_class",
+    values_to = "uncertainty_weight"
+  )
+
+long_data <- long_data |> 
+  mutate(latent_class = factor(latent_class, levels = c("prob4", "prob2", "prob1",  "prob5",  "prob3"), labels = c("Stable normal BMI", "Persistent low BMI", "Early overweight resolving",  "Childhood onset obesity", "Adolescent onset overweight")),
+         latent_class = relevel(latent_class, ref = "Stable normal BMI"))
+
+long_data <- long_data |> 
+  mutate(total_weight = ipweight_stabilized*uncertainty_weight)
+
+```
+
+### eTable 8: Univariable, unadjusted
+
+#### Sociodemographic
+
+sex
+
+```{r}
+
+model <- multinom(latent_class ~ sex, data = long_data, weights = total_weight)
+model_summary <- tidy(model, conf.int = TRUE, exponentiate = TRUE)
+model_summary
+
+table_summary_sex <- model_summary |> 
+  filter(term !="(Intercept)") |> 
+  mutate(`OR [95% CI]` = paste0(round2(estimate, 2), " [", format(round2(`conf.low`, 2), nsmall=2), "–", format(round2(`conf.high`, 2), nsmall=2), "]")) |> 
+  select(`y.level`, `term`, `OR [95% CI]`) |> 
+  pivot_wider(
+    names_from = y.level,
+    values_from = `OR [95% CI]` 
+  )
+
+table_summary_sex
+
+```
+
+
+
+Birth year
+
+```{r}
+#| warning: false
+
+long_data <- long_data |> 
+  mutate(birth_year_cat = factor(birth_year_cat,
+                                 levels = c("1993-1997", "1985-1989")))
+
+model <- multinom(latent_class ~ birth_year_cat, data = long_data, weights = total_weight)
+model_summary <- tidy(model, conf.int = TRUE, exponentiate = TRUE)
+model_summary
+
+table_summary_birth_year <- model_summary |> 
+  filter(term !="(Intercept)") |> 
+  mutate(`OR [95% CI]` = paste0(round2(estimate, 2), " [", format(round2(`conf.low`, 2), nsmall=2), "–", format(round2(`conf.high`, 2), nsmall=2), "]")) |> 
+  select(`y.level`, `term`, `OR [95% CI]`) |> 
+  pivot_wider(
+    names_from = y.level,
+    values_from = `OR [95% CI]` 
+  )
+
+table_summary_birth_year
+
+```
+
+Ethnicity
+
+```{r}
+#| warning: false
+
+model <- multinom(latent_class ~ ethnicity_cohort, data = long_data, weights = total_weight)
+model_summary <- tidy(model, conf.int = TRUE, exponentiate = TRUE)
+model_summary
+
+
+
+table_summary_ethnicity <- model_summary |> 
+  filter(term !="(Intercept)") |> 
+  mutate(`OR [95% CI]` = paste0(round2(estimate, 2), " [", format(round2(`conf.low`, 2), nsmall=2), "–", format(round2(`conf.high`, 2), nsmall=2), "]")) |> 
+  select(`y.level`, `term`, `OR [95% CI]`) |> 
+  pivot_wider(
+    names_from = y.level,
+    values_from = `OR [95% CI]` 
+  )
+
+table_summary_ethnicity
+
+```
+
+Parental education
+
+```{r}
+#| warning: false
+
+long_data <- long_data |> 
+  mutate(parental_education_cat = case_when(parental_education_cat=="unkown" ~ NA,
+                                            TRUE ~ parental_education_cat))
+
+
+model <- multinom(latent_class ~ parental_education_cat, data = long_data, weights = total_weight)
+model_summary <- tidy(model, conf.int = TRUE, exponentiate = TRUE)
+model_summary
+
+table_summary_parental_education <- model_summary |> 
+  filter(term !="(Intercept)") |> 
+  mutate(`OR [95% CI]` = paste0(round2(estimate, 2), " [", format(round2(`conf.low`, 2), nsmall=2), "–", format(round2(`conf.high`, 2), nsmall=2), "]")) |> 
+  select(`y.level`, `term`, `OR [95% CI]`) |> 
+  pivot_wider(
+    names_from = y.level,
+    values_from = `OR [95% CI]` 
+  )
+
+table_summary_parental_education
+
+```
+
+
+Urbanization
+
+```{r}
+
+model <- multinom(latent_class ~ urban_rural, data = long_data, weights = total_weight)
+model_summary <- tidy(model, conf.int = TRUE, exponentiate = TRUE)
+model_summary
+
+table_summary_urban_rural <- model_summary |> 
+  filter(term !="(Intercept)") |> 
+  mutate(`OR [95% CI]` = paste0(round2(estimate, 2), " [", format(round2(`conf.low`, 2), nsmall=2), "–", format(round2(`conf.high`, 2), nsmall=2), "]")) |> 
+  select(`y.level`, `term`, `OR [95% CI]`) |> 
+  pivot_wider(
+    names_from = y.level,
+    values_from = `OR [95% CI]` 
+  )
+
+table_summary_urban_rural
+
+
+```
+
+
+Townsend 
+
+```{r}
+#| warning: false
+
+long_data <- long_data |> 
+  mutate(townsend_2001_quintile = factor(townsend_2001_quintile, levels = c(1,2,3,4,5)))
+
+
+model_t1 <- multinom(latent_class ~ townsend_2001_quintile, data = long_data, weights = total_weight)
+model_summary <- tidy(model_t1, conf.int = TRUE, exponentiate = TRUE)
+model_summary
+
+model_t2 <- multinom(latent_class ~ townsend_2001, data = long_data, weights = total_weight)
+model_summary <- tidy(model_t2, conf.int = TRUE, exponentiate = TRUE)
+model_summary
+
+model_t3 <- multinom(latent_class ~ townsend_2001 + I(townsend_2001^2), data = long_data, weights = total_weight)
+model_summary <- tidy(model_t3, conf.int = TRUE, exponentiate = TRUE)
+model_summary
+
+AIC(model_t1, model_t2, model_t3)
+BIC(model_t1, model_t2, model_t3)
+
+model_t1 <- multinom(latent_class ~ townsend_2001_quintile, data = long_data, weights = total_weight)
+model_summary <- tidy(model_t1, conf.int = TRUE, exponentiate = TRUE)
+model_summary
+
+table_summary_townsend <- model_summary |> 
+  filter(term !="(Intercept)") |> 
+  mutate(`OR [95% CI]` = paste0(round2(estimate, 2), " [", format(round2(`conf.low`, 2), nsmall=2), "–", format(round2(`conf.high`, 2), nsmall=2), "]")) |> 
+  select(`y.level`, `term`, `OR [95% CI]`) |> 
+  pivot_wider(
+    names_from = y.level,
+    values_from = `OR [95% CI]` 
+  )
+
+table_summary_townsend
+
+
+
+
+
+
+```
+
+
+
+
+#### Perinatal
+
+Birth order
+
+```{r}
+
+
+
+model <- multinom(latent_class ~ birth_order_cat, data = long_data, weights = total_weight)
+model_summary <- tidy(model, conf.int = TRUE, exponentiate = TRUE)
+model_summary
+
+table_summary_birth_order <- model_summary |> 
+  filter(term !="(Intercept)") |> 
+  mutate(`OR [95% CI]` = paste0(round2(estimate, 2), " [", format(round2(`conf.low`, 2), nsmall=2), "–", format(round2(`conf.high`, 2), nsmall=2), "]")) |> 
+  select(`y.level`, `term`, `OR [95% CI]`) |> 
+  pivot_wider(
+    names_from = y.level,
+    values_from = `OR [95% CI]` 
+  )
+
+table_summary_birth_order
+
+```
+
+
+
+Age mother birth
+
+```{r}
+#| warning: false
+
+Leicester_data_weighted |>
+  filter(!is.na(class)) |>
+  summarize(
+    sd_val = sqrt(wtd.var(age_mother_delivery, weights = ipweight_stabilized, na.rm = TRUE))
+  ) |>
+  pull(sd_val)
+
+model <- multinom(latent_class ~ scale(age_mother_delivery), data = long_data, weights = total_weight)
+model_summary <- tidy(model, conf.int = TRUE, exponentiate = TRUE)
+model_summary
+
+table_summary_age_mother <- model_summary |> 
+  filter(term !="(Intercept)") |> 
+  mutate(`OR [95% CI]` = paste0(round2(estimate, 2), " [", format(round2(`conf.low`, 2), nsmall=2), "–", format(round2(`conf.high`, 2), nsmall=2), "]")) |> 
+  select(`y.level`, `term`, `OR [95% CI]`) |> 
+  pivot_wider(
+    names_from = y.level,
+    values_from = `OR [95% CI]` 
+  )
+
+table_summary_age_mother
+
+```
+
+
+Gestational age
+
+```{r}
+#| warning: false
+
+Leicester_data_weighted |>
+  filter(!is.na(class)) |>
+  summarize(
+    sd_val = sqrt(wtd.var(gestational_age, weights = ipweight_stabilized, na.rm = TRUE))
+  ) |>
+  pull(sd_val)
+
+model <- multinom(latent_class ~ scale(gestational_age), data = long_data, weights = total_weight)
+model_summary <- tidy(model, conf.int = TRUE, exponentiate = TRUE)
+model_summary
+
+table_summary_gestational_age <- model_summary |> 
+  filter(term !="(Intercept)") |> 
+  mutate(`OR [95% CI]` = paste0(round2(estimate, 2), " [", format(round2(`conf.low`, 2), nsmall=2), "–", format(round2(`conf.high`, 2), nsmall=2), "]")) |> 
+  select(`y.level`, `term`, `OR [95% CI]`) |> 
+  pivot_wider(
+    names_from = y.level,
+    values_from = `OR [95% CI]` 
+  )
+
+table_summary_gestational_age
+
+```
+
+Birth_weight
+
+```{r}
+#| warning: false
+
+Leicester_data_weighted |>
+  filter(!is.na(class)) |>
+  summarize(
+    sd_val = sqrt(wtd.var(birth_weight, weights = ipweight_stabilized, na.rm = TRUE))
+  ) |>
+  pull(sd_val)
+
+model <- multinom(latent_class ~ scale(birth_weight), data = long_data, weights = total_weight)
+model_summary <- tidy(model, conf.int = TRUE, exponentiate = TRUE)
+model_summary
+
+table_summary_birth_weight <- model_summary |> 
+  filter(term !="(Intercept)") |> 
+  mutate(`OR [95% CI]` = paste0(round2(estimate, 2), " [", format(round2(`conf.low`, 2), nsmall=2), "–", format(round2(`conf.high`, 2), nsmall=2), "]")) |> 
+  select(`y.level`, `term`, `OR [95% CI]`) |> 
+  pivot_wider(
+    names_from = y.level,
+    values_from = `OR [95% CI]` 
+  )
+
+table_summary_birth_weight
+
+```
+
+#### Lifestyle 
+
+Smoking pregnancy
+
+```{r}
+#| warning: false
+
+
+
+model <- multinom(latent_class ~ smoking_mother_pregnancy, data = long_data, weights = total_weight)
+model_summary <- tidy(model, conf.int = TRUE, exponentiate = TRUE)
+model_summary
+
+table_summary_smoking_pregnancy <- model_summary |> 
+  filter(term !="(Intercept)") |> 
+  mutate(`OR [95% CI]` = paste0(round2(estimate, 2), " [", format(round2(`conf.low`, 2), nsmall=2), "–", format(round2(`conf.high`, 2), nsmall=2), "]")) |> 
+  select(`y.level`, `term`, `OR [95% CI]`) |> 
+  pivot_wider(
+    names_from = y.level,
+    values_from = `OR [95% CI]` 
+  )
+
+table_summary_smoking_pregnancy
+
+```
+
+Breast feeding
+
+```{r}
+#| warning: false
+
+model <- multinom(latent_class ~ breast_feeding, data = long_data, weights = total_weight)
+model_summary <- tidy(model, conf.int = TRUE, exponentiate = TRUE)
+model_summary
+
+table_summary_breast_feeding <- model_summary |> 
+  filter(term !="(Intercept)") |> 
+  mutate(`OR [95% CI]` = paste0(round2(estimate, 2), " [", format(round2(`conf.low`, 2), nsmall=2), "–", format(round2(`conf.high`, 2), nsmall=2), "]")) |> 
+  select(`y.level`, `term`, `OR [95% CI]`) |> 
+  pivot_wider(
+    names_from = y.level,
+    values_from = `OR [95% CI]` 
+  )
+
+table_summary_breast_feeding
+
+```
+
+
+
+
+
+Second hand smoke
+
+```{r}
+#| warning: false
+
+
+model <- multinom(latent_class ~ smoking_others_ever, data = long_data, weights = total_weight)
+model_summary <- tidy(model, conf.int = TRUE, exponentiate = TRUE)
+model_summary
+
+table_summary_smoking_others_ever <- model_summary |> 
+  filter(term !="(Intercept)") |> 
+  mutate(`OR [95% CI]` = paste0(round2(estimate, 2), " [", format(round2(`conf.low`, 2), nsmall=2), "–", format(round2(`conf.high`, 2), nsmall=2), "]")) |> 
+  select(`y.level`, `term`, `OR [95% CI]`) |> 
+  pivot_wider(
+    names_from = y.level,
+    values_from = `OR [95% CI]` 
+  )
+
+table_summary_smoking_others_ever
+
+```
+
+
+Vigorous physical activity
+
+```{r}
+#| warning: false
+
+model <- multinom(latent_class ~ physical_activity_cat_minimal, data = long_data, weights = total_weight)
+model_summary <- tidy(model, conf.int = TRUE, exponentiate = TRUE)
+model_summary
+
+table_summary_physical_activity <- model_summary |> 
+  filter(term !="(Intercept)") |> 
+  mutate(`OR [95% CI]` = paste0(round2(estimate, 2), " [", format(round2(`conf.low`, 2), nsmall=2), "–", format(round2(`conf.high`, 2), nsmall=2), "]")) |> 
+  select(`y.level`, `term`, `OR [95% CI]`) |> 
+  pivot_wider(
+    names_from = y.level,
+    values_from = `OR [95% CI]` 
+  )
+
+table_summary_physical_activity
+
+```
+
+#### Diet composition
+
+Fresh fruit
+
+```{r}
+#| warning: false
+
+
+long_data <- long_data |> 
+  mutate(fresh_fruit = factor(fresh_fruit_cat_mean,
+                              levels = c("Once daily or more", "less than once daily")))
+
+
+model <- multinom(latent_class ~ fresh_fruit, data = long_data, weights = total_weight)
+model_summary <- tidy(model, conf.int = TRUE, exponentiate = TRUE)
+model_summary
+
+table_summary_fresh_fruit <- model_summary |> 
+  filter(term !="(Intercept)") |> 
+  mutate(`OR [95% CI]` = paste0(round2(estimate, 2), " [", format(round2(`conf.low`, 2), nsmall=2), "–", format(round2(`conf.high`, 2), nsmall=2), "]")) |> 
+  select(`y.level`, `term`, `OR [95% CI]`) |> 
+  pivot_wider(
+    names_from = y.level,
+    values_from = `OR [95% CI]` 
+  ) |> filter(term == "fresh_fruitless than once daily")
+
+table_summary_fresh_fruit
+
+
+model_summary_fresh_fruit <- model_summary |> 
+  filter(term !="(Intercept)") |> 
+  filter(term == "fresh_fruitless than once daily") |> 
+  mutate(aOR = estimate,
+         lower_ci = conf.low,
+         upper_ci = conf.high,
+         class = y.level) |> 
+  select(class, term, aOR, lower_ci, upper_ci)
+
+```
+
+Vegetables
+
+```{r}
+#| warning: false
+
+
+long_data <- long_data |> 
+  mutate(vegetables = factor(vegetables_cat_mean,
+                              levels = c("Once daily or more", "less than once daily")))
+
+
+model <- multinom(latent_class ~ vegetables, data = long_data, weights = total_weight)
+model_summary <- tidy(model, conf.int = TRUE, exponentiate = TRUE)
+model_summary
+
+table_summary_vegetables <- model_summary |> 
+  filter(term !="(Intercept)") |> 
+  mutate(`OR [95% CI]` = paste0(round2(estimate, 2), " [", format(round2(`conf.low`, 2), nsmall=2), "–", format(round2(`conf.high`, 2), nsmall=2), "]")) |> 
+  select(`y.level`, `term`, `OR [95% CI]`) |> 
+  pivot_wider(
+    names_from = y.level,
+    values_from = `OR [95% CI]` 
+  ) |> filter(term == "vegetablesless than once daily")
+
+table_summary_vegetables
+
+
+model_summary_vegetables <- model_summary |> 
+  filter(term !="(Intercept)") |> 
+  filter(term == "vegetablesless than once daily") |> 
+  mutate(aOR = estimate,
+         lower_ci = conf.low,
+         upper_ci = conf.high,
+         class = y.level) |> 
+  select(class, term, aOR, lower_ci, upper_ci)
+
+```
+
+
+
+Crisps
+
+```{r}
+#| warning: false
+
+long_data <- long_data |> 
+  mutate(crisps = factor(crisps_cat_mean,
+                              levels = c("Once daily or more", "less than once daily")))
+
+model <- multinom(latent_class ~ crisps, data = long_data, weights = total_weight)
+model_summary <- tidy(model, conf.int = TRUE, exponentiate = TRUE)
+model_summary
+
+table_summary_crisps <- model_summary |> 
+  filter(term !="(Intercept)") |> 
+  mutate(`OR [95% CI]` = paste0(round2(estimate, 2), " [", format(round2(`conf.low`, 2), nsmall=2), "–", format(round2(`conf.high`, 2), nsmall=2), "]")) |> 
+  select(`y.level`, `term`, `OR [95% CI]`) |> 
+  pivot_wider(
+    names_from = y.level,
+    values_from = `OR [95% CI]` 
+  ) |> filter(term == "crispsless than once daily")
+
+table_summary_crisps
+
+
+model_summary_crisps <- model_summary |> 
+  filter(term !="(Intercept)") |> 
+  filter(term == "crispsless than once daily") |> 
+  mutate(aOR = estimate,
+         lower_ci = conf.low,
+         upper_ci = conf.high,
+         class = y.level) |> 
+  select(class, term, aOR, lower_ci, upper_ci)
+
+```
+
+
+
+Chocolates
+
+```{r}
+#| warning: false
+
+
+long_data <- long_data |> 
+  mutate(chocolates = factor(chocolate_cat_mean,
+                              levels = c("Once daily or more", "less than once daily")))
+
+
+
+model <- multinom(latent_class ~ chocolates, data = long_data, weights = total_weight)
+model_summary <- tidy(model, conf.int = TRUE, exponentiate = TRUE)
+model_summary
+
+table_summary_chocolates <- model_summary |> 
+  filter(term !="(Intercept)") |> 
+  mutate(`OR [95% CI]` = paste0(round2(estimate, 2), " [", format(round2(`conf.low`, 2), nsmall=2), "–", format(round2(`conf.high`, 2), nsmall=2), "]")) |> 
+  select(`y.level`, `term`, `OR [95% CI]`) |> 
+  pivot_wider(
+    names_from = y.level,
+    values_from = `OR [95% CI]` 
+  ) |> filter(term == "chocolatesless than once daily")
+
+table_summary_chocolates
+
+
+model_summary_chocolates <- model_summary |> 
+  filter(term !="(Intercept)") |> 
+  filter(term == "chocolatesless than once daily") |> 
+  mutate(aOR = estimate,
+         lower_ci = conf.low,
+         upper_ci = conf.high,
+         class = y.level) |> 
+  select(class, term, aOR, lower_ci, upper_ci)
+
+```
+
+
+
+
+
+
+
+#### Combined table
+
+```{r}
+
+table_multinomial_regression_univariable <- table_summary_sex |> 
+    bind_rows(table_summary_birth_year, table_summary_ethnicity, table_summary_parental_education, table_summary_urban_rural, table_summary_townsend, 
+              table_summary_birth_order, table_summary_age_mother, table_summary_smoking_pregnancy, table_summary_gestational_age, table_summary_birth_weight, table_summary_breast_feeding,
+              table_summary_smoking_others_ever, table_summary_physical_activity, table_summary_fresh_fruit, table_summary_vegetables, table_summary_crisps, table_summary_chocolates)
+
+```
+
+
+### eTable 9: At-risk groups: adjusted sociodemographics and perinatal
+
+
+```{r}
+
+cat("number of participants:", Leicester_data |> filter(!is.na(class) & !is.na(birth_year_cat) & !is.na(ethnicity_cohort) & !is.na(parental_education_cat) & !is.na(urban_rural) & !is.na(townsend_2001_quintile) & !is.na(birth_order_cat) & !is.na(age_mother_delivery) & !is.na(gestational_age) & !is.na(birth_weight)) |> nrow())
+
+Leicester_data |> filter(!is.na(class) & !is.na(birth_year_cat) & !is.na(ethnicity_cohort) & !is.na(parental_education_cat) & !is.na(urban_rural) & !is.na(townsend_2001_quintile) & !is.na(birth_order_cat) & !is.na(age_mother_delivery) & !is.na(gestational_age) & !is.na(birth_weight)) |> select(class) |> tbl_summary()
+
+model <- multinom(latent_class ~ sex + birth_year_cat + ethnicity_cohort + parental_education_cat + urban_rural + townsend_2001_quintile + birth_order_cat + I(scale(age_mother_delivery)) + I(scale(gestational_age)) + I(scale(birth_weight)), data = long_data, weights = total_weight)
+model_summary <- tidy(model, conf.int = TRUE, exponentiate = TRUE)
+model_summary
+
+table_multinomial_regression_at_risk <- model_summary |> 
+  filter(term !="(Intercept)") |> 
+  mutate(`OR [95% CI]` = paste0(round2(estimate, 2), " [", format(round2(`conf.low`, 2), nsmall=2), "–", format(round2(`conf.high`, 2), nsmall=2), "]")) |> 
+  select(`y.level`, `term`, `OR [95% CI]`) |> 
+  pivot_wider(
+    names_from = y.level,
+    values_from = `OR [95% CI]` 
+  )
+
+table_multinomial_regression_at_risk
+
+
+model_summary_at_risk <- model_summary |> 
+  filter(term !="(Intercept)") |> 
+  mutate(aOR = estimate,
+         lower_ci = conf.low,
+         upper_ci = conf.high,
+         class = y.level) |> 
+  select(class, term, aOR, lower_ci, upper_ci)
+
+
+```
+
+
+### Figure 3: At-risk groups
+
+Prepare data for forrest plot
+
+```{r}
+
+# combine model summaries
+table_plot_multinomial_regression_at_risk <- model_summary_at_risk
+
+
+```
+
+
+
+```{r}
+
+table_plot_multinomial_regression_at_risk <- table_plot_multinomial_regression_at_risk |> 
+  mutate(term = case_when(term == "sexfemale" ~ "Female",
+                          term == "birth_year_cat1985-1989" ~ "'1985–1989'",
+                          term == "ethnicity_cohortSouth Asian" ~ "'South Asian'",
+                          term == "urban_ruralrural" ~ "'Suburbs and rural'",
+                          term == "townsend_2001_quintile2" ~ "'Quintile 2'",
+                          term == "townsend_2001_quintile3" ~ "'Quintile 3'",
+                          term == "townsend_2001_quintile4" ~ "'Quintile 4'",
+                          term == "townsend_2001_quintile5" ~ "'Quintile 5'",
+                          term == "parental_education_catfurther education" ~ "Further",
+                          term == "parental_education_cathigher education" ~ "Higher",
+                          term == "I(scale(age_mother_delivery))" ~ "'Per 1 SD increase: 5.3 years'",
+                          term == "I(scale(gestational_age))" ~ "'Per 1 SD increase: 1.9 weeks'",
+                          term == "I(scale(birth_weight))" ~ "'Per 1 SD increase: 566 grams'",
+                          term == "birth_order_catsecond child" ~ "'Second child'",
+                          term == "birth_order_catthird or later child" ~ "'Third or later child'"))
+
+table_regression_reference <- data.frame(class = c("variable",
+                                                   "variable",
+                                                   "variable",
+                                                   "variable",
+                                                   "variable",
+                                                   "variable",
+                                                   
+                                                   "variable",
+                                                   "variable",
+                                                   "variable",
+                                                   "variable"),
+                                         term = c("bold(Sex)*', ref: Male'",
+                                                  "bold('Birth year')*', ref: 1993–1997'",
+                                                  "bold(Ethnicity)*', ref: White'",
+                                                  "bold('Degree of urbanization')*', ref: Inner city'",
+                                                  "bold('Townsend index')*', ref: Quintile 1'",
+                                                  "bold('Parental education')*', ref: Compulsory'",
+                                                  
+                                                  "bold('Birth order')*', ref: First child'",
+                                                  "bold('Age of mother at birth')",
+                                                  "bold('Gestational age')",
+                                                  "bold('Birth weight')"),
+                                         aOR = 1,
+                                         lower_ci = NA,
+                                         upper_ci = NA)
+
+table_plot_multinomial_regression_at_risk <- table_plot_multinomial_regression_at_risk |> 
+  bind_rows(table_regression_reference) |> 
+mutate(term = factor(term,
+                     levels = c(
+                       "'Per 1 SD increase: 566 grams'",
+                       "bold('Birth weight')",
+                       "'Per 1 SD increase: 1.9 weeks'",
+                       "bold('Gestational age')",
+                       "'Per 1 SD increase: 5.3 years'",
+                       "bold('Age of mother at birth')",
+                       "'Third or later child'",
+                       "'Second child'",
+                       "bold('Birth order')*', ref: First child'",
+                       
+                       "'Quintile 5'",
+                       "'Quintile 4'",
+                       "'Quintile 3'",
+                       "'Quintile 2'",
+                       "bold('Townsend index')*', ref: Quintile 1'",
+                       "'Suburbs and rural'",
+                       "bold('Degree of urbanization')*', ref: Inner city'",
+                       "Higher",
+                       "Further",
+                       "bold('Parental education')*', ref: Compulsory'",
+                       "'South Asian'",
+                       "bold(Ethnicity)*', ref: White'",
+                       "'1985–1989'",
+                       "bold('Birth year')*', ref: 1993–1997'",
+                       "Female",
+                       "bold(Sex)*', ref: Male'"
+                     ))) |> 
+  mutate(group = case_when(term == "bold(Sex)*', ref: Male'" ~ "Sociodemographic",
+                           term == "Female"~ "Sociodemographic",
+                           term == "bold('Birth year')*', ref: 1993–1997'" ~ "Sociodemographic",
+                           term == "'1985–1989'" ~ "Sociodemographic",
+                           term == "bold(Ethnicity)*', ref: White'"~ "Sociodemographic",
+                           term == "'South Asian'"~ "Sociodemographic",
+                           term == "bold('Degree of urbanization')*', ref: Inner city'"~ "Sociodemographic",
+                           term == "'Suburbs and rural'"~ "Sociodemographic",
+                           term == "bold('Townsend index')*', ref: Quintile 1'"~ "Sociodemographic",
+                           term == "'Quintile 2'"~ "Sociodemographic",
+                           term == "'Quintile 3'"~ "Sociodemographic",
+                           term == "'Quintile 4'"~ "Sociodemographic",
+                           term == "'Quintile 5'"~ "Sociodemographic",
+                           term == "bold('Parental education')*', ref: Compulsory'"~ "Sociodemographic",
+                           term == "Further"~ "Sociodemographic",
+                           term == "Higher"~ "Sociodemographic",
+                           term == "bold('Age of mother at birth')"~ "Birth related",
+                           term == "'Per 1 SD increase: 5.3 years'"~ "Birth related",
+                           term == "bold('Gestational age')"~ "Birth related",
+                           term == "'Per 1 SD increase: 1.9 weeks'"~ "Birth related",
+                           term == "bold('Birth weight')" ~ "Birth related",
+                           term == "'Per 1 SD increase: 566 grams'"~ "Birth related",
+                           term == "bold('Birth order')*', ref: First child'" ~ "Birth related",
+                           term == "'Second child'"~ "Birth related",
+                           term == "'Third or later child'"~ "Birth related")) |> 
+  mutate(hide = factor(case_when(class == "reference" | class == "variable" ~ "Yes",
+                          TRUE ~ "No"), levels = c("Yes", "No")))
+  
+
+table_plot_multinomial_regression_at_risk <- table_plot_multinomial_regression_at_risk |> 
+  mutate(transparency = case_when(term == "bold('Age of mother at birth')" ~ "transparent",
+                                  term == "bold('Gestational age')" ~ "transparent",
+                                  term == "bold('Birth weight')" ~ "transparent",
+                                  TRUE ~ "normal"))
+
+```
+
+#### Plot by trajectory
+
+```{r}
+
+plot_forrest_multinomial_below_normal <- table_plot_multinomial_regression_at_risk |>
+  filter(class == "Persistent low BMI" | class == "variable") |> 
+  ggplot(aes(x = aOR, y = term)) +
+  geom_vline(xintercept = 1, linetype = "dashed", color = "black") +
+  geom_vline(xintercept = 0.25, color = "black") +
+  geom_vline(xintercept = 4, color = "black") +
+  geom_point(aes(alpha = transparency), size = 1, position = position_dodge(width = 1), colour = unibeIce()) +
+  geom_errorbarh(aes(xmin = lower_ci, xmax = upper_ci),
+                 height = 0.25, linewidth = 0.25,
+                 position = position_dodge(width = 1),
+                 colour = unibeIce()) +
+  scale_x_continuous(breaks = c(0.25, 0.5, 1, 2, 4), transform = "log", expand = c(0,0)) +
+  coord_cartesian(xlim = c(0.25, 4), expand = FALSE, clip = "on")+
+  scale_y_discrete(labels = function(x) parse(text = x), expand = c(0,0))+
+  scale_alpha_manual(breaks = c("transparent", "normal"), values = c(0, 100), guide = "none")+
+  labs(x = "**aOR** (log scale)", y = "") +
+  theme_minimal() +
+  theme(panel.grid.minor = element_blank(),
+        panel.grid.major.y = element_blank(),
+        axis.title.x = element_markdown(size = 8),
+        axis.text.y = element_text(size = 8, color = "black", margin = margin(0, 0, 0, 0)),
+        axis.text.x = element_text(size = 8, color = "black"),
+        legend.position = "none",
+        plot.margin = margin(t = 0.75, r = 0.7, l = 0.4, b = 0.5, unit = "cm"))
+    
+
+
+plot_forrest_multinomial_below_normal
+
+
+plot_forrest_multinomial_early_overweight <- table_plot_multinomial_regression_at_risk |>
+  filter(class == "Early overweight resolving" | class == "variable") |> 
+  ggplot(aes(x = aOR, y = term)) +
+  geom_vline(xintercept = 1, linetype = "dashed", color = "black") +
+  geom_vline(xintercept = 0.25, color = "black") +
+  geom_vline(xintercept = 4, color = "black") +
+  geom_point(aes(alpha = transparency),size = 1, position = position_dodge(width = 1), colour = unibeMustard()) +
+  geom_errorbarh(aes(xmin = lower_ci, xmax = upper_ci),
+                 height = 0.25, linewidth = 0.25,
+                 position = position_dodge(width = 1),
+                 colour = unibeMustard()) +
+  scale_x_continuous(breaks = c(0.25, 0.5, 1, 2, 4), transform = "log", expand = c(0,0)) +
+  coord_cartesian(xlim = c(0.25, 4), expand = FALSE, clip = "on")+
+  scale_y_discrete(labels = function(x) parse(text = x), expand = c(0,0))+
+  scale_alpha_manual(breaks = c("transparent", "normal"), values = c(0, 100), guide = "none")+
+  labs(x = "**aOR** (log scale)", y = "") +
+  theme_minimal() +
+  theme(panel.grid.minor = element_blank(),
+        panel.grid.major.y = element_blank(),
+        axis.title.x = element_markdown(size = 8),
+        axis.text.y = element_text(size = 8, color = "black", margin = margin(0, 0, 0, 0)),
+        axis.text.x = element_text(size = 8, color = "black"),
+        legend.position = "none",
+        plot.margin = margin(t = 0.75, r = 0.7, l = 0.4, b = 0.5, unit = "cm"))
+    
+
+
+plot_forrest_multinomial_early_overweight
+
+
+plot_forrest_multinomial_school_obesity <- table_plot_multinomial_regression_at_risk |>
+  filter(class == "Childhood onset obesity" | class == "variable") |> 
+  ggplot(aes(x = aOR, y = term)) +
+  geom_vline(xintercept = 1, linetype = "dashed", color = "black") +
+  geom_vline(xintercept = 0.25, color = "black") +
+  geom_vline(xintercept = 4, color = "black") +
+  geom_point(aes(alpha = transparency),size = 1, position = position_dodge(width = 1), colour = unibeRed()) +
+  geom_errorbarh(aes(xmin = lower_ci, xmax = upper_ci),
+                 height = 0.25, linewidth = 0.25,
+                 position = position_dodge(width = 1),
+                 colour = unibeRed()) +
+  scale_x_continuous(breaks = c(0.25, 0.5, 1, 2, 4), transform = "log", expand = c(0,0)) +
+  coord_cartesian(xlim = c(0.25, 4), expand = FALSE, clip = "on")+
+  scale_y_discrete(labels = function(x) parse(text = x), expand = c(0,0))+
+  scale_alpha_manual(breaks = c("transparent", "normal"), values = c(0, 100), guide = "none")+
+  labs(x = "**aOR** (log scale)", y = "") +
+  theme_minimal() +
+  theme(panel.grid.minor = element_blank(),
+        panel.grid.major.y = element_blank(),
+        axis.title.x = element_markdown(size = 8),
+        axis.text.y = element_text(size = 8, color = "black", margin = margin(0, 0, 0, 0)),
+        axis.text.x = element_text(size = 8, color = "black"),
+        legend.position = "none",
+        plot.margin = margin(t = 0.75, r = 0.7, l = 0.4, b = 0.5, unit = "cm"))
+    
+
+
+plot_forrest_multinomial_school_obesity
+
+plot_forrest_multinomial_adolescent_overweight <- table_plot_multinomial_regression_at_risk |>
+  filter(class == "Adolescent onset overweight" | class == "variable") |> 
+  ggplot(aes(x = aOR, y = term)) +
+  geom_vline(xintercept = 1, linetype = "dashed", color = "black") +
+  geom_vline(xintercept = 0.25, color = "black") +
+  geom_vline(xintercept = 4, color = "black") +
+  geom_point(aes(alpha = transparency),size = 1, position = position_dodge(width = 1), colour = unibeApricot()) +
+  geom_errorbarh(aes(xmin = lower_ci, xmax = upper_ci),
+                 height = 0.25, linewidth = 0.25,
+                 position = position_dodge(width = 1),
+                 colour = unibeApricot()) +
+  scale_x_continuous(breaks = c(0.25, 0.5, 1, 2, 4), transform = "log", expand = c(0,0)) +
+  coord_cartesian(xlim = c(0.25, 4), expand = FALSE, clip = "on")+
+  scale_y_discrete(labels = function(x) parse(text = x), expand = c(0,0))+
+  scale_alpha_manual(breaks = c("transparent", "normal"), values = c(0, 100), guide = "none")+
+  labs(x = "**aOR** (log scale)", y = "") +
+  theme_minimal() +
+  theme(panel.grid.minor = element_blank(),
+        panel.grid.major.y = element_blank(),
+        axis.title.x = element_markdown(size = 8),
+        axis.text.y = element_text(size = 8, color = "black", margin = margin(0, 0, 0, 0)),
+        axis.text.x = element_text(size = 8, color = "black"),
+        legend.position = "none",
+        plot.margin = margin(t = 0.75, r = 0.7, l = 0.4, b = 0.5, unit = "cm"))
+    
+
+
+plot_forrest_multinomial_adolescent_overweight
+
+
+
+y_axis_plot <- table_plot_multinomial_regression_at_risk |>
+  filter(class == "Childhood onset obesity" | class == "variable") |> 
+  ggplot(aes(x = 1, y = term)) +
+  geom_point(size = 1, position = position_dodge(width = 1), alpha = 0) +
+  scale_y_discrete(labels = function(x) parse(text = x), expand = c(0,0))+
+  theme_minimal() +
+  theme(panel.grid.minor = element_blank(),
+        panel.grid.major = element_blank(),
+        axis.title = element_blank(),
+        axis.text.y = element_text(size = 8, color = "black"),
+        axis.text.x = element_blank(),
+        legend.position = "none",
+        plot.margin = margin(l = 0.25, b = 0, t = 0, r = 0, unit = "cm"))
+
+y_axis_plot
+
+
+plot_forrest_multinomial_at_risk <- plot_grid(y_axis_plot,
+                                      plot_forrest_multinomial_below_normal + theme(axis.text.y = element_blank()),
+                                      plot_forrest_multinomial_early_overweight + theme(axis.text.y = element_blank()),
+                                      plot_forrest_multinomial_school_obesity + theme(axis.text.y = element_blank()),
+                                      plot_forrest_multinomial_adolescent_overweight + theme(axis.text.y = element_blank()),
+                                      ncol = 5,
+                                      align = "h",
+                                      labels = c(" ", "Persistent low BMI", "Early overweight resolving", "Childhood onset obesity", "Adolescent onset overweight"),
+                                      label_size = 10,
+                                      label_x = 0.5,
+                                      hjust = 0.5)
+
+ggsave(plot_forrest_multinomial_at_risk, filename = here("output", "figures", "plot_forrest_multinomial_at_risk.svg"), device = "svg", units = "cm", bg = "white", width = 28, height = 11.5)
+
+
+```
+
+
+### eTable 10: Risk factors: fully adjusted
+
+
+```{r}
+
+long_data <- long_data |> 
+  mutate(breast_feeding = factor(breast_feeding,
+                                             levels = c("yes", "no")))
+
+long_data <- long_data |> 
+  mutate(fresh_fruit = factor(fresh_fruit_cat_mean,
+                              levels = c("Once daily or more", "less than once daily")))
+
+cat("number of participants:", Leicester_data |> filter(!is.na(class) & !is.na(birth_year_cat) & !is.na(ethnicity_cohort) & !is.na(parental_education_cat) & !is.na(urban_rural) & !is.na(townsend_2001_quintile) & !is.na(birth_order_cat) & !is.na(age_mother_delivery) & !is.na(gestational_age) & !is.na(birth_weight) & !is.na(smoking_mother_pregnancy) & !is.na(breast_feeding) & !is.na(smoking_others_ever) & !is.na(physical_activity_cat_minimal) & !is.na(fresh_fruit_cat)) |> nrow())
+
+Leicester_data |> filter(!is.na(class) & !is.na(birth_year_cat) & !is.na(ethnicity_cohort) & !is.na(parental_education_cat) & !is.na(urban_rural) & !is.na(townsend_2001_quintile) & !is.na(birth_order_cat) & !is.na(age_mother_delivery) & !is.na(gestational_age) & !is.na(birth_weight) & !is.na(smoking_mother_pregnancy) & !is.na(breast_feeding) & !is.na(smoking_others_ever) & !is.na(physical_activity_cat_minimal) & !is.na(fresh_fruit_cat)) |> select(class) |> tbl_summary()
+
+model <- multinom(latent_class ~ sex + birth_year_cat + ethnicity_cohort + parental_education_cat + urban_rural + townsend_2001_quintile + birth_order_cat + I(scale(age_mother_delivery)) + I(scale(gestational_age)) + I(scale(birth_weight)) + smoking_mother_pregnancy + breast_feeding + smoking_others_ever + physical_activity_cat_minimal + fresh_fruit, data = long_data, weights = total_weight)
+model_summary <- tidy(model, conf.int = TRUE, exponentiate = TRUE)
+model_summary
+
+table_multinomial_regression_risk_factors <- model_summary |> 
+  filter(term !="(Intercept)") |> 
+  mutate(`OR [95% CI]` = paste0(round2(estimate, 2), " [", format(round2(`conf.low`, 2), nsmall=2), "–", format(round2(`conf.high`, 2), nsmall=2), "]")) |> 
+  select(`y.level`, `term`, `OR [95% CI]`) |> 
+  pivot_wider(
+    names_from = y.level,
+    values_from = `OR [95% CI]` 
+  )
+
+table_multinomial_regression_risk_factors
+
+
+model_summary_risk_factors <- model_summary |> 
+  filter(term !="(Intercept)") |> 
+  mutate(aOR = estimate,
+         lower_ci = conf.low,
+         upper_ci = conf.high,
+         class = y.level) |> 
+  select(class, term, aOR, lower_ci, upper_ci)
+
+
+```
+
+### Figure 4: Risk factors
+
+Prepare data for forrest plot
+
+```{r}
+
+# combine model summaries
+table_plot_multinomial_regression_risk_factors <- model_summary_risk_factors
+
+
+```
+
+
+
+```{r}
+
+table_plot_multinomial_regression_risk_factors <- table_plot_multinomial_regression_risk_factors |> 
+  mutate(term = case_when(term == "sexfemale" ~ "Female",
+                          term == "birth_year_cat1985-1989" ~ "'1985–1989'",
+                          term == "ethnicity_cohortSouth Asian" ~ "'South Asian'",
+                          term == "urban_ruralrural" ~ "'Suburbs and rural'",
+                          term == "townsend_2001_quintile2" ~ "'Quintile 2'",
+                          term == "townsend_2001_quintile3" ~ "'Quintile 3'",
+                          term == "townsend_2001_quintile4" ~ "'Quintile 4'",
+                          term == "townsend_2001_quintile5" ~ "'Quintile 5'",
+                          term == "parental_education_catfurther education" ~ "Further",
+                          term == "parental_education_cathigher education" ~ "Higher",
+                          term == "I(scale(age_mother_delivery))" ~ "'Per 1 SD increase: 5.3 years'",
+                          term == "I(scale(gestational_age))" ~ "'Per 1 SD increase: 1.9 weeks'",
+                          term == "I(scale(birth_weight))" ~ "'Per 1 SD increase: 566 grams'",
+                          term == "birth_order_catsecond child" ~ "'Second child'",
+                          term == "birth_order_catthird or later child" ~ "'Third or later child'",
+                          term == "smoking_mother_pregnancyyes" ~ "Yes",
+                          term == "breast_feedingno" ~ "No",
+                          term == "physical_activity_cat_minimal>= 4 hrs per week" ~ "'≥4 hrs/week'",
+                          term == "fresh_fruitless than once daily" ~ "'Less than once daily'",
+                          term == "smoking_others_everyes" ~ "' Yes'"))
+
+table_regression_reference <- data.frame(class = c("variable",
+                                                   "variable",
+                                                   "variable",
+                                                   "variable",
+                                                   "variable",
+                                                   "variable",
+                                                   "variable",
+                                                   "variable",
+                                                   "variable",
+                                                   "variable",
+                                                   "variable",
+                                                   "variable",
+                                                   "variable",
+                                                   "variable",
+                                                   "variable"),
+                                         term = c("bold(Sex)*', ref: Male'",
+                                                  "bold('Birth year')*', ref: 1993–1997'",
+                                                  "bold(Ethnicity)*', ref: White'",
+                                                  "bold('Degree of urbanization')*', ref: Inner city'",
+                                                  "bold('Townsend index')*', ref: Quintile 1'",
+                                                  "bold('Parental education')*', ref: Compulsory'",
+                                                  
+                                                  "bold('Birth order')*', ref: First child'",
+                                                  "bold('Age of mother at birth')",
+                                                  "bold('Gestational age')",
+                                                  "bold('Birth weight')",
+                                                  
+                                                  "bold('Smoking during pregnancy')*', ref: No'",
+                                                  "bold(Breastfeeding)*', ref: Yes'",
+                                                  "bold('Secondhand tobacco smoke')*', ref: No'",
+                                                  "bold('Physical activity')*', ref: 0–3 hrs/week'",
+                                                  "bold('Fresh fruit intake')*', ref: Once daily or more'"),
+                                         aOR = 1,
+                                         lower_ci = NA,
+                                         upper_ci = NA)
+
+table_plot_multinomial_regression_risk_factors <- table_plot_multinomial_regression_risk_factors |> 
+  bind_rows(table_regression_reference) |> 
+mutate(term = factor(term,
+                     levels = c(
+                       "'Less than once daily'",
+                       "bold('Fresh fruit intake')*', ref: Once daily or more'",
+                       "'≥4 hrs/week'",
+                       "bold('Physical activity')*', ref: 0–3 hrs/week'",
+                       "' Yes'",
+                       "bold('Secondhand tobacco smoke')*', ref: No'",
+                       "No",
+                       "bold(Breastfeeding)*', ref: Yes'",
+                       "Yes",
+                       "bold('Smoking during pregnancy')*', ref: No'",
+                       
+                       "'Per 1 SD increase: 566 grams'",
+                       "bold('Birth weight')",
+                       "'Per 1 SD increase: 1.9 weeks'",
+                       "bold('Gestational age')",
+                       "'Per 1 SD increase: 5.3 years'",
+                       "bold('Age of mother at birth')",
+                       "'Third or later child'",
+                       "'Second child'",
+                       "bold('Birth order')*', ref: First child'",
+                       
+                       "'Quintile 5'",
+                       "'Quintile 4'",
+                       "'Quintile 3'",
+                       "'Quintile 2'",
+                       "bold('Townsend index')*', ref: Quintile 1'",
+                       "'Suburbs and rural'",
+                       "bold('Degree of urbanization')*', ref: Inner city'",
+                       "Higher",
+                       "Further",
+                       "bold('Parental education')*', ref: Compulsory'",
+                       "'South Asian'",
+                       "bold(Ethnicity)*', ref: White'",
+                       "'1985–1989'",
+                       "bold('Birth year')*', ref: 1993–1997'",
+                       "Female",
+                       "bold(Sex)*', ref: Male'"
+                     ))) |> 
+  mutate(group = case_when(term == "bold(Sex)*', ref: Male'" ~ "Sociodemographic",
+                           term == "Female"~ "Sociodemographic",
+                           term == "bold('Birth year')*', ref: 1993–1997'" ~ "Sociodemographic",
+                           term == "'1985–1989'" ~ "Sociodemographic",
+                           term == "bold(Ethnicity)*', ref: White'"~ "Sociodemographic",
+                           term == "'South Asian'"~ "Sociodemographic",
+                           term == "bold('Degree of urbanization')*', ref: Inner city'"~ "Sociodemographic",
+                           term == "'Suburbs and rural'"~ "Sociodemographic",
+                           term == "bold('Townsend index')*', ref: Quintile 1'"~ "Sociodemographic",
+                           term == "'Quintile 2'"~ "Sociodemographic",
+                           term == "'Quintile 3'"~ "Sociodemographic",
+                           term == "'Quintile 4'"~ "Sociodemographic",
+                           term == "'Quintile 5'"~ "Sociodemographic",
+                           term == "bold('Parental education')*', ref: Compulsory'"~ "Sociodemographic",
+                           term == "Further"~ "Sociodemographic",
+                           term == "Higher"~ "Sociodemographic",
+                           term == "bold('Smoking during pregnancy')*', ref: No'"~ "Birth related",
+                           term == "Yes"~ "Birth related",
+                           term == "bold('Age of mother at birth')"~ "Birth related",
+                           term == "'Per 1 SD increase: 5.3 years'"~ "Birth related",
+                           term == "bold('Gestational age')"~ "Birth related",
+                           term == "'Per 1 SD increase: 1.9 weeks'"~ "Birth related",
+                           term == "bold('Birth weight')" ~ "Birth related",
+                           term == "'Per 1 SD increase: 566 grams'"~ "Birth related",
+                           term == "bold('Birth order')*', ref: First child'" ~ "Birth related",
+                           term == "'Second child'"~ "Birth related",
+                           term == "'Third or later child'"~ "Birth related",
+                           term == "bold(Breastfeeding)*', ref: Yes'"~ "Birth related",
+                           term == "No"~ "Birth related",
+                           term == "bold('Secondhand tobacco smoke')*', ref: No'" ~ "Lifestyle",
+                           term == "' Yes'" ~ "Lifestyle",
+                           term == "bold('Physical activity')*', ref: 0–3 hrs/week'" ~ "Lifestyle",
+                           term == "'≥4 hrs/week'" ~ "Lifestyle",
+                           term == "bold('Fresh fruit intake')*', ref: Once daily or more'" ~ "Lifestyle",
+                           term == "'Less than once daily'" ~ "Lifestyle")) |> 
+  mutate(hide = factor(case_when(class == "reference" | class == "variable" ~ "Yes",
+                          TRUE ~ "No"), levels = c("Yes", "No")))
+  
+
+table_plot_multinomial_regression_risk_factors <- table_plot_multinomial_regression_risk_factors |> 
+  mutate(transparency = case_when(term == "bold('Age of mother at birth')" ~ "transparent",
+                                  term == "bold('Gestational age')" ~ "transparent",
+                                  term == "bold('Birth weight')" ~ "transparent",
+                                  TRUE ~ "normal"))
+
+```
+
+#### Plot by trajectory
+
+```{r}
+
+plot_forrest_multinomial_below_normal <- table_plot_multinomial_regression_risk_factors |>
+  filter(class == "Persistent low BMI" | class == "variable") |> 
+  ggplot(aes(x = aOR, y = term)) +
+  geom_vline(xintercept = 1, linetype = "dashed", color = "black") +
+  geom_vline(xintercept = 0.25, color = "black") +
+  geom_vline(xintercept = 4, color = "black") +
+  geom_point(aes(alpha = transparency), size = 1, position = position_dodge(width = 1), colour = unibeIce()) +
+  geom_errorbarh(aes(xmin = lower_ci, xmax = upper_ci),
+                 height = 0.25, linewidth = 0.25,
+                 position = position_dodge(width = 1),
+                 colour = unibeIce()) +
+  scale_x_continuous(breaks = c(0.25, 0.5, 1, 2, 4), transform = "log", expand = c(0,0)) +
+  coord_cartesian(xlim = c(0.25, 4), expand = FALSE, clip = "on")+
+  scale_y_discrete(labels = function(x) parse(text = x), expand = c(0,0))+
+  scale_alpha_manual(breaks = c("transparent", "normal"), values = c(0, 100), guide = "none")+
+  labs(x = "**aOR** (log scale)", y = "") +
+  theme_minimal() +
+  theme(panel.grid.minor = element_blank(),
+        panel.grid.major.y = element_blank(),
+        axis.title.x = element_markdown(size = 8),
+        axis.text.y = element_text(size = 8, color = "black", margin = margin(0, 0, 0, 0)),
+        axis.text.x = element_text(size = 8, color = "black"),
+        legend.position = "none",
+        plot.margin = margin(t = 0.75, r = 0.7, l = 0.4, b = 0.5, unit = "cm"))
+    
+
+
+plot_forrest_multinomial_below_normal
+
+
+plot_forrest_multinomial_early_overweight <- table_plot_multinomial_regression_risk_factors |>
+  filter(class == "Early overweight resolving" | class == "variable") |> 
+  ggplot(aes(x = aOR, y = term)) +
+  geom_vline(xintercept = 1, linetype = "dashed", color = "black") +
+  geom_vline(xintercept = 0.25, color = "black") +
+  geom_vline(xintercept = 4, color = "black") +
+  geom_point(aes(alpha = transparency),size = 1, position = position_dodge(width = 1), colour = unibeMustard()) +
+  geom_errorbarh(aes(xmin = lower_ci, xmax = upper_ci),
+                 height = 0.25, linewidth = 0.25,
+                 position = position_dodge(width = 1),
+                 colour = unibeMustard()) +
+  scale_x_continuous(breaks = c(0.25, 0.5, 1, 2, 4), transform = "log", expand = c(0,0)) +
+  coord_cartesian(xlim = c(0.25, 4), expand = FALSE, clip = "on")+
+  scale_y_discrete(labels = function(x) parse(text = x), expand = c(0,0))+
+  scale_alpha_manual(breaks = c("transparent", "normal"), values = c(0, 100), guide = "none")+
+  labs(x = "**aOR** (log scale)", y = "") +
+  theme_minimal() +
+  theme(panel.grid.minor = element_blank(),
+        panel.grid.major.y = element_blank(),
+        axis.title.x = element_markdown(size = 8),
+        axis.text.y = element_text(size = 8, color = "black", margin = margin(0, 0, 0, 0)),
+        axis.text.x = element_text(size = 8, color = "black"),
+        legend.position = "none",
+        plot.margin = margin(t = 0.75, r = 0.7, l = 0.4, b = 0.5, unit = "cm"))
+    
+
+
+plot_forrest_multinomial_early_overweight
+
+
+plot_forrest_multinomial_school_obesity <- table_plot_multinomial_regression_risk_factors |>
+  filter(class == "Childhood onset obesity" | class == "variable") |> 
+  ggplot(aes(x = aOR, y = term)) +
+  geom_vline(xintercept = 1, linetype = "dashed", color = "black") +
+  geom_vline(xintercept = 0.25, color = "black") +
+  geom_vline(xintercept = 4, color = "black") +
+  geom_point(aes(alpha = transparency),size = 1, position = position_dodge(width = 1), colour = unibeRed()) +
+  geom_errorbarh(aes(xmin = lower_ci, xmax = upper_ci),
+                 height = 0.25, linewidth = 0.25,
+                 position = position_dodge(width = 1),
+                 colour = unibeRed()) +
+  scale_x_continuous(breaks = c(0.25, 0.5, 1, 2, 4), transform = "log", expand = c(0,0)) +
+  coord_cartesian(xlim = c(0.25, 4), expand = FALSE, clip = "on")+
+  scale_y_discrete(labels = function(x) parse(text = x), expand = c(0,0))+
+  scale_alpha_manual(breaks = c("transparent", "normal"), values = c(0, 100), guide = "none")+
+  labs(x = "**aOR** (log scale)", y = "") +
+  theme_minimal() +
+  theme(panel.grid.minor = element_blank(),
+        panel.grid.major.y = element_blank(),
+        axis.title.x = element_markdown(size = 8),
+        axis.text.y = element_text(size = 8, color = "black", margin = margin(0, 0, 0, 0)),
+        axis.text.x = element_text(size = 8, color = "black"),
+        legend.position = "none",
+        plot.margin = margin(t = 0.75, r = 0.7, l = 0.4, b = 0.5, unit = "cm"))
+    
+
+
+plot_forrest_multinomial_school_obesity
+
+plot_forrest_multinomial_adolescent_overweight <- table_plot_multinomial_regression_risk_factors |>
+  filter(class == "Adolescent onset overweight" | class == "variable") |> 
+  ggplot(aes(x = aOR, y = term)) +
+  geom_vline(xintercept = 1, linetype = "dashed", color = "black") +
+  geom_vline(xintercept = 0.25, color = "black") +
+  geom_vline(xintercept = 4, color = "black") +
+  geom_point(aes(alpha = transparency),size = 1, position = position_dodge(width = 1), colour = unibeApricot()) +
+  geom_errorbarh(aes(xmin = lower_ci, xmax = upper_ci),
+                 height = 0.25, linewidth = 0.25,
+                 position = position_dodge(width = 1),
+                 colour = unibeApricot()) +
+  scale_x_continuous(breaks = c(0.25, 0.5, 1, 2, 4), transform = "log", expand = c(0,0)) +
+  coord_cartesian(xlim = c(0.25, 4), expand = FALSE, clip = "on")+
+  scale_y_discrete(labels = function(x) parse(text = x), expand = c(0,0))+
+  scale_alpha_manual(breaks = c("transparent", "normal"), values = c(0, 100), guide = "none")+
+  labs(x = "**aOR** (log scale)", y = "") +
+  theme_minimal() +
+  theme(panel.grid.minor = element_blank(),
+        panel.grid.major.y = element_blank(),
+        axis.title.x = element_markdown(size = 8),
+        axis.text.y = element_text(size = 8, color = "black", margin = margin(0, 0, 0, 0)),
+        axis.text.x = element_text(size = 8, color = "black"),
+        legend.position = "none",
+        plot.margin = margin(t = 0.75, r = 0.7, l = 0.4, b = 0.5, unit = "cm"))
+    
+
+
+plot_forrest_multinomial_adolescent_overweight
+
+
+
+y_axis_plot <- table_plot_multinomial_regression_risk_factors |>
+  filter(class == "Childhood onset obesity" | class == "variable") |> 
+  ggplot(aes(x = 1, y = term)) +
+  geom_point(size = 1, position = position_dodge(width = 1), alpha = 0) +
+  scale_y_discrete(labels = function(x) parse(text = x), expand = c(0,0))+
+  theme_minimal() +
+  theme(panel.grid.minor = element_blank(),
+        panel.grid.major = element_blank(),
+        axis.title = element_blank(),
+        axis.text.y = element_text(size = 8, color = "black"),
+        axis.text.x = element_blank(),
+        legend.position = "none",
+        plot.margin = margin(l = 0.25, b = 0, t = 0, r = 0, unit = "cm"))
+
+y_axis_plot
+
+
+plot_forrest_multinomial_risk_factors <- plot_grid(y_axis_plot,
+                                      plot_forrest_multinomial_below_normal + theme(axis.text.y = element_blank()),
+                                      plot_forrest_multinomial_early_overweight + theme(axis.text.y = element_blank()),
+                                      plot_forrest_multinomial_school_obesity + theme(axis.text.y = element_blank()),
+                                      plot_forrest_multinomial_adolescent_overweight + theme(axis.text.y = element_blank()),
+                                      ncol = 5,
+                                      align = "h",
+                                      labels = c(" ", "Persistent low BMI", "Early overweight resolving", "Childhood onset obesity", "Adolescent onset overweight"),
+                                      label_size = 10,
+                                      label_x = 0.5,
+                                      hjust = 0.5)
+
+ggsave(plot_forrest_multinomial_risk_factors, filename = here("output", "figures", "plot_forrest_multinomial_risk_factors.svg"), device = "svg", units = "cm", bg = "white", width = 28, height = 17.5)
+
+
+```
+
+
+
+
+### eTable 11 & 12: Stratified by ethnicity
+
+
+#### South Asians
+
+```{r}
+
+long_data_asians <- long_data |> filter(ethnicity_cohort == "South Asian")
+
+Leicester_data |> filter(ethnicity_cohort == "South Asian") |> select(class) |> tbl_summary()
+
+
+```
+
+
+```{r}
+
+long_data_asians <- long_data_asians |> 
+  mutate(parental_education_cat = factor(parental_education_cat,
+                                             levels = c("higher education", "further education", "compulsory education")))
+
+long_data_asians <- long_data_asians |> 
+  mutate(townsend_2001_quintile = factor(townsend_2001_quintile,
+                                             levels = c("5", "4", "3", "2", "1")))
+
+
+long_data_asians <- long_data_asians |> 
+  mutate(fresh_fruit = factor(fresh_fruit_cat_mean,
+                              levels = c("Once daily or more", "less than once daily")))
+
+cat("number of participants:", Leicester_data |> filter(ethnicity_cohort == "South Asian") |> filter(!is.na(class) & !is.na(parental_education_cat) & !is.na(townsend_2001_quintile) & !is.na(birth_order_cat) & !is.na(age_mother_delivery) & !is.na(gestational_age) & !is.na(birth_weight) & !is.na(breast_feeding) & !is.na(smoking_others_ever) & !is.na(physical_activity_cat_minimal) & !is.na(fresh_fruit_cat)) |> nrow())
+
+Leicester_data |> filter(ethnicity_cohort == "South Asian") |> filter(!is.na(class) & !is.na(parental_education_cat) & !is.na(urban_rural) & !is.na(townsend_2001_quintile) & !is.na(birth_order_cat) & !is.na(age_mother_delivery) & !is.na(gestational_age) & !is.na(birth_weight) & !is.na(breast_feeding) & !is.na(smoking_others_ever) & !is.na(physical_activity_cat_minimal) & !is.na(fresh_fruit_cat)) |> select(class) |> tbl_summary()
+
+model <- multinom(latent_class ~ sex + parental_education_cat + townsend_2001_quintile + birth_order_cat + I(scale(age_mother_delivery)) + I(scale(gestational_age)) + I(scale(birth_weight)) + breast_feeding + smoking_others_ever + physical_activity_cat_minimal + fresh_fruit, data = long_data_asians, weights = total_weight)
+model_summary <- tidy(model, conf.int = TRUE, exponentiate = TRUE)
+model_summary
+
+table_multinomial_regression_risk_factors_SA <- model_summary |> 
+  filter(term !="(Intercept)") |> 
+  mutate(`OR [95% CI]` = paste0(round2(estimate, 2), " [", format(round2(`conf.low`, 2), nsmall=2),"–",format(round2(`conf.high`,2),nsmall=2),"]")) |> 
+  select(`y.level`, `term`, `OR [95% CI]`) |> 
+  pivot_wider(
+    names_from = y.level,
+    values_from = `OR [95% CI]` 
+  )
+
+table_multinomial_regression_risk_factors_SA
+
+
+model_summary_risk_factors_SA <- model_summary |> 
+  filter(term !="(Intercept)") |> 
+  mutate(aOR = estimate,
+         lower_ci = conf.low,
+         upper_ci = conf.high,
+         class = y.level) |> 
+  select(class, term, aOR, lower_ci, upper_ci)
+
+
+```
+#### Whites
+
+```{r}
+
+long_data_whites <- long_data |> filter(ethnicity_cohort == "White")
+
+Leicester_data |> filter(ethnicity_cohort == "White") |> select(class) |> tbl_summary()
+
+
+```
+
+
+```{r}
+
+long_data_whites <- long_data_whites |> 
+  mutate(fresh_fruit = factor(fresh_fruit_cat_mean,
+                              levels = c("Once daily or more", "less than once daily")))
+
+
+
+cat("number of participants:", Leicester_data |> filter(ethnicity_cohort == "White") |> filter(!is.na(class) & !is.na(birth_year_cat) & !is.na(parental_education_cat) & !is.na(urban_rural) & !is.na(townsend_2001_quintile) & !is.na(birth_order_cat) & !is.na(age_mother_delivery) & !is.na(gestational_age) & !is.na(birth_weight) & !is.na(smoking_mother_pregnancy) & !is.na(breast_feeding) & !is.na(smoking_others_ever) & !is.na(physical_activity_cat_minimal) & !is.na(fresh_fruit_cat)) |> nrow())
+
+Leicester_data |> filter(ethnicity_cohort == "White") |> filter(!is.na(class) & !is.na(birth_year_cat) & !is.na(parental_education_cat) & !is.na(urban_rural) & !is.na(townsend_2001_quintile) & !is.na(birth_order_cat) & !is.na(age_mother_delivery) & !is.na(gestational_age) & !is.na(birth_weight) & !is.na(smoking_mother_pregnancy) & !is.na(breast_feeding) & !is.na(smoking_others_ever) & !is.na(physical_activity_cat_minimal) & !is.na(fresh_fruit_cat)) |> select(class) |> tbl_summary()
+
+model <- multinom(latent_class ~ sex + birth_year_cat + parental_education_cat + urban_rural + townsend_2001_quintile + birth_order_cat + I(scale(age_mother_delivery)) + I(scale(gestational_age)) + I(scale(birth_weight)) + smoking_mother_pregnancy + breast_feeding + smoking_others_ever + physical_activity_cat_minimal + fresh_fruit, data = long_data_whites, weights = total_weight)
+model_summary <- tidy(model, conf.int = TRUE, exponentiate = TRUE)
+model_summary
+
+table_multinomial_regression_risk_factors_WH <- model_summary |> 
+  filter(term !="(Intercept)") |> 
+  mutate(`OR [95% CI]` = paste0(round2(estimate, 2), " [", format(round2(`conf.low`, 2), nsmall=2),"–",format(round2(`conf.high`,2),nsmall=2),"]")) |> 
+  select(`y.level`, `term`, `OR [95% CI]`) |> 
+  pivot_wider(
+    names_from = y.level,
+    values_from = `OR [95% CI]` 
+  )
+
+table_multinomial_regression_risk_factors_WH
+
+
+model_summary_risk_factors_WH <- model_summary |> 
+  filter(term !="(Intercept)") |> 
+  mutate(aOR = estimate,
+         lower_ci = conf.low,
+         upper_ci = conf.high,
+         class = y.level) |> 
+  select(class, term, aOR, lower_ci, upper_ci)
+
+
+```

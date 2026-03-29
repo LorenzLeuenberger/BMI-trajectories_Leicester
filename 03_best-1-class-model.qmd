@@ -1,0 +1,968 @@
+---
+title: "Find best 1-class model before estimating growth mixture models on ubelix"
+author: "Lorenz Leuenberger"
+date: "`r date()`"
+title-block-banner: "#e4003c"
+format: 
+  html:
+    toc: true
+    number-sections: true
+    code-fold: show
+    code-tools: true
+    df-print: paged
+    embed-resources: true
+editor_options: 
+  chunk_output_type: inline
+---
+
+# Introduction
+
+I would like to first test whether we can use polynomials and splines with GMM.
+Then I would like to find the best pattern for the 1-class model.
+
+## Import data
+
+```{r}
+
+
+library(here)
+library(lcmm) # for growth mixture models
+library(splines) # for splines
+library(tidyverse)
+library(parallel)
+library(mgcv) # for penalized splines
+
+data <- read.csv(here("data", "processed", "Leicester_anthro_pseudonymized_18.csv"))
+interpolated_ukwho_bmi <- read.csv(here("data", "interpolated-growth-references", "interpolated_ukwho_bmi.csv"))
+
+```
+
+
+
+# Test polynomials with GMM
+
+1 latent class
+
+```{r}
+
+m_poly_1 <- hlme(fixed = bmi ~ poly(age_years, degree = 3),
+                  random = ~ -1,
+                  subject = "participant_id",
+                  ng = 1,
+                  data = data)
+
+summary(m_poly_1)
+
+
+data_predict <- data.frame(age_years = seq(0,18,length.out=1000))
+
+data_predict <- predictY(m_poly_1, data_predict, var.time = "age_years", draws = TRUE)
+
+data_predict <- data.frame(data_predict[2], data_predict[1])
+
+data_predict <- data_predict %>% 
+  rename("mean_class1" = "pred.Ypred",
+         "lower_class1" = "pred.lower.Ypred",
+         "upper_class1" = "pred.upper.Ypred")
+
+data_predict <- data_predict %>% 
+  pivot_longer(cols = -age_years,
+               names_to = c(".value", "class"),
+               names_sep = "_",
+               values_to = "value")
+
+plot_m_poly_1 <- data_predict %>% 
+  ggplot(aes(x = age_years, y = mean, colour = class)) + 
+  geom_line()+
+  geom_ribbon(aes(ymin = lower, ymax = upper), alpha = 0.3)
+
+plot_m_poly_1
+
+```
+
+
+2 latent classes
+
+```{r}
+
+
+m_poly_2 <- hlme(fixed = bmi ~ poly(age_years, degree = 3),
+               mixture = ~ poly(age_years, degree = 3),
+               random = ~ -1,
+               subject = "participant_id",
+               ng = 2,
+               B = m_poly_1,
+               data = data)
+
+
+data_predict <- data.frame(age_years = seq(0,18,length.out=1000))
+
+data_predict <- predictY(m_poly_2, data_predict, var.time = "age_years", draws = TRUE)
+
+data_predict <- data.frame(data_predict[2], data_predict[1])
+
+data_predict <- data_predict %>% 
+  rename("mean_class1" = "pred.Ypred_class1", "mean_class2" = "pred.Ypred_class2",
+         "lower_class1" = "pred.lower.Ypred_class1", "lower_class2" = "pred.lower.Ypred_class2",
+         "upper_class1" = "pred.upper.Ypred_class1", "upper_class2" = "pred.upper.Ypred_class2")
+
+data_predict <- data_predict %>% 
+  pivot_longer(cols = -age_years,
+               names_to = c(".value", "class"),
+               names_sep = "_",
+               values_to = "value")
+
+plot_m_poly_2 <- data_predict %>% 
+  ggplot(aes(x = age_years, y = mean, colour = class)) + 
+  geom_line()+
+  geom_ribbon(aes(ymin = lower, ymax = upper), alpha = 0.3)
+
+plot_m_poly_2
+
+```
+
+
+Compare models
+
+```{r}
+
+summarytable(m_poly_1, m_poly_2)
+
+```
+
+# Test splines with GMM
+
+
+## B splines
+
+1 latent class
+
+```{r}
+
+m_bs_1 <- hlme(fixed = bmi ~  bs(age_years, knots = c(0.5875055, 7.251932, 14.35975), degree = 2),
+                  random = ~ 1 + age_years,
+                  subject = "participant_id",
+                  ng = 1,
+                  data = data)
+
+summary(m_bs_1)
+
+knots <- attr(splines::bs(data$age_years, degree = 2, df = 6), "knots")
+
+summarytable(m_bs_1)
+
+# plot
+data_predict <- data.frame(age_years = seq(0,18,length.out=1000))
+
+data_predict <- predictY(m_bs_1, data_predict, var.time = "age_years", draws = TRUE)
+
+data_predict <- data.frame(data_predict[2], data_predict[1])
+
+data_predict <- data_predict %>% 
+  rename("mean_class1" = "pred.Ypred",
+         "lower_class1" = "pred.lower.Ypred",
+         "upper_class1" = "pred.upper.Ypred")
+
+data_predict <- data_predict %>% 
+  pivot_longer(cols = -age_years,
+               names_to = c(".value", "class"),
+               names_sep = "_",
+               values_to = "value")
+
+plot_m_bs_1 <- data_predict %>% 
+  ggplot(aes(x = age_years, y = mean, colour = class)) + 
+  geom_line()+
+  geom_ribbon(aes(ymin = lower, ymax = upper), alpha = 0.3)+
+  geom_vline(xintercept = knots)
+
+plot_m_bs_1
+
+
+```
+
+2 latent classes
+
+```{r}
+
+
+m_bs_2 <- hlme(fixed = bmi ~ bs(age_years, knots = c(0.5875055, 7.251932, 14.35975), degree = 2),
+               mixture = ~ bs(age_years, knots = c(0.5875055, 7.251932, 14.35975), degree = 2),
+               random = ~ 1 + age_years,
+               subject = "participant_id",
+               ng = 3,
+               B = m_bs_1,
+               data = data)
+
+
+data_predict <- data.frame(age_years = seq(0,18,length.out=1000))
+
+data_predict <- predictY(m_bs_2, data_predict, var.time = "age_years", draws = TRUE)
+
+data_predict <- data.frame(data_predict[2], data_predict[1])
+
+data_predict <- data_predict %>% 
+  rename("mean_class1" = "pred.Ypred_class1", "mean_class2" = "pred.Ypred_class2",
+         "lower_class1" = "pred.lower.Ypred_class1", "lower_class2" = "pred.lower.Ypred_class2",
+         "upper_class1" = "pred.upper.Ypred_class1", "upper_class2" = "pred.upper.Ypred_class2")
+
+data_predict <- data_predict %>% 
+  pivot_longer(cols = -age_years,
+               names_to = c(".value", "class"),
+               names_sep = "_",
+               values_to = "value")
+
+plot_m_bs_2 <- data_predict %>% 
+  ggplot(aes(x = age_years, y = mean, colour = class)) + 
+  geom_line()+
+  geom_ribbon(aes(ymin = lower, ymax = upper), alpha = 0.3)
+
+plot_m_bs_2
+
+summarytable(m_bs_2)
+
+summary(m_bs_2)
+
+```
+
+
+Compare models
+
+```{r}
+
+summarytable(m_bs_1, m_bs_2)
+
+```
+
+## Natural cubic splines
+1 latent class
+
+```{r}
+
+m_ns_1 <- hlme(fixed = bmi ~ splines::ns(age_years, df = 4),
+                  random = ~ 1,
+                  subject = "participant_id",
+                  ng = 1,
+                  data = data)
+
+summary(m_ns_1)
+summarytable(m_ns_1)
+
+knots <- attr(splines::ns(data$age_years, df = 4), "knots")
+
+data_predict <- data.frame(age_years = seq(0,18,length.out=1000))
+
+data_predict <- predictY(m_ns_1, data_predict, var.time = "age_years", draws = TRUE)
+
+data_predict <- data.frame(data_predict[2], data_predict[1])
+
+data_predict <- data_predict %>% 
+  rename("mean_class1" = "pred.Ypred",
+         "lower_class1" = "pred.lower.Ypred",
+         "upper_class1" = "pred.upper.Ypred")
+
+data_predict <- data_predict %>% 
+  pivot_longer(cols = -age_years,
+               names_to = c(".value", "class"),
+               names_sep = "_",
+               values_to = "value")
+
+plot_m_ns_1 <- data_predict %>% 
+  ggplot(aes(x = age_years, y = mean, colour = class)) + 
+  geom_line()+
+  geom_ribbon(aes(ymin = lower, ymax = upper), alpha = 0.3)+
+  geom_vline(xintercept = knots)
+
+plot_m_ns_1
+
+
+```
+
+
+2 latent classes
+
+```{r}
+
+
+m_ns_2 <- hlme(fixed = bmi ~ splines::ns(age_years, df = 4),
+               mixture = ~ splines::ns(age_years, df = 4),
+               random = ~ 1,
+               subject = "participant_id",
+               ng = 2,
+               B = m_ns_1,
+               data = data)
+
+
+data_predict <- data.frame(age_years = seq(0,18,length.out=1000))
+
+data_predict <- predictY(m_ns_2, data_predict, var.time = "age_years", draws = TRUE)
+
+data_predict <- data.frame(data_predict[2], data_predict[1])
+
+data_predict <- data_predict %>% 
+  rename("mean_class1" = "pred.Ypred_class1", "mean_class2" = "pred.Ypred_class2",
+         "lower_class1" = "pred.lower.Ypred_class1", "lower_class2" = "pred.lower.Ypred_class2",
+         "upper_class1" = "pred.upper.Ypred_class1", "upper_class2" = "pred.upper.Ypred_class2")
+
+data_predict <- data_predict %>% 
+  pivot_longer(cols = -age_years,
+               names_to = c(".value", "class"),
+               names_sep = "_",
+               values_to = "value")
+
+plot_m_ns_2 <- data_predict %>% 
+  ggplot(aes(x = age_years, y = mean, colour = class)) + 
+  geom_line()+
+  geom_ribbon(aes(ymin = lower, ymax = upper), alpha = 0.3)+
+  geom_vline(xintercept = knots)
+
+plot_m_ns_2
+
+```
+
+
+Compare models
+
+```{r}
+
+summarytable(m_ns_1, m_ns_2)
+
+```
+
+
+# Best 1-class lm model
+
+## Estimate models
+
+
+
+```{r}
+
+m1a <- lm(bmi ~ age_years, data = data)
+
+m1b <- lm(bmi ~ poly(age_years, degree = 2), data = data)
+
+m1c <- lm(bmi ~ poly(age_years, degree = 3), data = data)
+
+m1d <- lm(bmi ~ splines::bs(age_years, degree = 2, df = 4), data = data)
+
+m1e <- lm(bmi ~ splines::bs(age_years, degree = 2, df = 5), data = data)
+
+m1f <- lm(bmi ~ splines::bs(age_years, degree = 3, df = 5), data = data)
+
+m1g <- lm(bmi ~ splines::bs(age_years, degree = 3, df = 6), data = data)
+
+m1h <- lm(bmi ~ splines::ns(age_years, df = 3), data = data)
+
+m1i <- lm(bmi ~ splines::ns(age_years, df = 4), data = data)
+
+```
+
+### Search for knot placement based on BIC and AIC
+
+Define functions to perform gridsearch
+
+```{r}
+
+# Function to fit B-spline or Natural Spline model and return AIC/BIC
+fit_spline_model <- function(knots, data, degree, spline_type = "bs") {
+  if (spline_type == "bs") {
+    model <- lm(bmi ~ bs(age_years, knots = knots, degree = degree), data = data)
+  } else if (spline_type == "ns") {
+    model <- lm(bmi ~ ns(age_years, knots = knots), data = data)
+  } else {
+    stop("Invalid spline_type. Use either 'bs' for B-splines or 'ns' for Natural splines.")
+  }
+  
+  predicted <- predict(model, newdata = data)
+  rmse <- sqrt(mean((data$bmi - predicted)^2))
+  
+  return(c(AIC = AIC(model), BIC = BIC(model), RMSE = rmse))
+}
+
+# Function to perform grid search with iterative refinement, supporting both B-splines and Natural splines
+spline_gridsearch <- function(range_1, range_2, range_3 = NULL, num_knots, degree, data, iterations = 3, spline_type = "bs") {
+  
+  current_range_1 <- range_1
+  current_range_2 <- range_2
+  current_range_3 <- range_3
+  
+  best_knots <- NULL
+  
+  for (i in 1:iterations) {
+    knots_1 <- seq(current_range_1[1], current_range_1[2], length.out = num_knots)
+    knots_2 <- seq(current_range_2[1], current_range_2[2], length.out = num_knots)
+    
+    if (!is.null(current_range_3)) {
+      knots_3 <- seq(current_range_3[1], current_range_3[2], length.out = num_knots)
+      knots_df <- expand.grid(knot_1 = knots_1, knot_2 = knots_2, knot_3 = knots_3)
+    } else {
+      knots_df <- expand.grid(knot_1 = knots_1, knot_2 = knots_2)
+    }
+    
+    no_cores <- detectCores() - 1
+    cl <- makeCluster(no_cores)
+    clusterExport(cl, list("fit_spline_model", "data"))
+    clusterEvalQ(cl, library(splines))
+    
+    aic_bic_rmse_values <- parApply(cl, knots_df, 1, function(row) {
+      if (!is.null(current_range_3)) {
+        knots <- c(row[1], row[2], row[3])
+      } else {
+        knots <- c(row[1], row[2])
+      }
+      fit_spline_model(knots, data, degree, spline_type)
+    })
+    
+    stopCluster(cl)
+    
+    results <- t(aic_bic_rmse_values)
+    results <- as.data.frame(results)
+    colnames(results) <- c("AIC", "BIC", "RMSE")
+    results$knot_1 <- knots_df$knot_1
+    results$knot_2 <- knots_df$knot_2
+    if (!is.null(current_range_3)) {
+      results$knot_3 <- knots_df$knot_3
+    }
+    
+    best_knots_aic <- c(results$knot_1[which.min(results$AIC)], results$knot_2[which.min(results$AIC)], ifelse(!is.null(current_range_3), results$knot_3[which.min(results$AIC)], NA))
+    best_knots_bic <- c(results$knot_1[which.min(results$BIC)], results$knot_2[which.min(results$BIC)], ifelse(!is.null(current_range_3), results$knot_3[which.min(results$BIC)], NA))
+    best_knots_rmse <- c(results$knot_1[which.min(results$RMSE)], results$knot_2[which.min(results$RMSE)], ifelse(!is.null(current_range_3), results$knot_3[which.min(results$RMSE)], NA))
+    
+    best_knots <- best_knots_bic
+    
+    current_range_1 <- c(best_knots[1] - (knots_1[2] - knots_1[1]),
+                         best_knots[1] + (knots_1[2] - knots_1[1]))
+    current_range_2 <- c(best_knots[2] - (knots_2[2] - knots_2[1]),
+                         best_knots[2] + (knots_2[2] - knots_2[1]))
+    
+    if (!is.null(current_range_3)) {
+      current_range_3 <- c(best_knots[3] - (knots_3[2] - knots_3[1]),
+                           best_knots[3] + (knots_3[2] - knots_3[1]))
+    }
+    
+    cat("Iteration:", i, "\n")
+    cat("Best BIC:", min(results$BIC), "; Best Knots:", best_knots, "\n")
+  }
+  
+  return(best_knots)
+}
+
+
+```
+
+Phases of BMI growth in children:
+
+- infancy (0-1.5 years)
+- childhood (1.5-12 years)
+- puberty (12-16 years)
+
+Based on previous knowledge of BMI growth and on the publication of [Nummi et al.](https://dx.doi.org/10.1080/02664763.2013.872232.) we search for the 2 knots between 0.5-2 years and 8-13 years. A possible 3rd knot is added between 14-17.5 years
+
+
+```{r}
+
+# quadratic b-splines
+
+m1j_knots <- spline_gridsearch(range_1 = c(0.3,2), range_2 = c(7,13), num_knots = 20, degree = 2, data = data, spline_type = "bs")
+
+m1j <- lm(bmi ~ bs(age_years, knots = m1j_knots, degree = 2), data = data)
+
+m1k_knots <- spline_gridsearch(range_1 = c(0.3,2), range_2 = c(7,13), range_3 = c(14,17.5), num_knots = 20, degree = 2, data = data, spline_type = "bs")
+
+m1k <- lm(bmi ~ bs(age_years, knots = m1k_knots, degree = 2), data = data)
+
+# cubic b-splines
+
+m1l_knots <- spline_gridsearch(range_1 = c(0.3,2), range_2 = c(7,13), num_knots = 20, degree = 3, data = data, spline_type = "bs")
+
+m1l <- lm(bmi ~ bs(age_years, knots = m1l_knots, degree = 3), data = data)
+
+m1m_knots <- spline_gridsearch(range_1 = c(0.3,2), range_2 = c(7,13), range_3 = c(14,17.5), num_knots = 20, degree = 3, data = data, spline_type = "bs")
+
+m1m <- lm(bmi ~ bs(age_years, knots = m1m_knots, degree = 3), data = data)
+
+# cubic natural splines
+
+m1n_knots <- spline_gridsearch(range_1 = c(0.3,2), range_2 = c(7,13), num_knots = 20, degree = 3, data = data, spline_type = "ns")
+
+m1n <- lm(bmi ~ ns(age_years, knots = m1n_knots), data = data)
+
+m1o_knots <- spline_gridsearch(range_1 = c(0.3,2), range_2 = c(7,13), range_3 = c(14,17.5), num_knots = 20, degree = 3, data = data, spline_type = "ns")
+
+m1o <- lm(bmi ~ ns(age_years, knots = m1o_knots), data = data)
+
+```
+
+
+## Choose best model
+
+Look at model summary
+
+```{r}
+
+compare_models <- function(models) {
+  model_comparison <- data.frame(
+    Model = character(),
+    AIC = numeric(),
+    BIC = numeric(),
+    LogLik = numeric(),
+    npm = numeric(),
+    stringsAsFactors = FALSE
+  )
+  
+  for (model_name in names(models)) {
+    model <- models[[model_name]]
+    
+    model_comparison <- rbind(model_comparison, data.frame(
+      Model = model_name,
+      AIC = AIC(model),
+      BIC = BIC(model),
+      LogLik = as.numeric(logLik(model)),
+      npm = length(coefficients(model)),
+      stringsAsFactors = FALSE
+    ))
+  }
+  
+  model_comparison <- model_comparison %>% 
+    arrange(BIC)
+  
+  return(model_comparison)
+}
+
+models <- list(
+  m1a = m1a, m1b = m1b, m1c = m1c, m1d = m1d, m1e = m1e,
+  m1f = m1f, m1g = m1g, m1h = m1h, m1i = m1i, m1j = m1j, m1k = m1k, m1l = m1l, m1m = m1m, m1n = m1n, m1o = m1o
+)
+
+model_comparison <- compare_models(models)
+
+print(model_comparison)
+
+```
+
+Based on BIC:
+
+- The best 1-class model is m1j with quadratic splines and 2 manually searched knots: 0.6650824 9.80449
+- The second best 1-class model is m1k with quadratic splines and 2 manually searched knots: 0.6650824 10.34597 13.7964 (better AIC and lower LogLik)
+
+## Plot models
+
+```{r}
+
+summary(m1j)
+
+# plot
+data_predict <- data.frame(age_years = seq(0,18,length.out=1000))
+
+m1j_predict <- predict(m1j, data_predict, se = TRUE)
+
+m1j_predict <- data.frame(m1j_predict[2], m1j_predict[1])
+
+m1j_predict <- m1j_predict %>% 
+  mutate(lower_m1j = fit - 1.96* se.fit,
+         upper_m1j = fit - 1.96* se.fit) %>% 
+  rename("mean_m1j" = "fit")
+
+m1j_predict <- m1j_predict %>% 
+  cbind(data_predict) %>% 
+  select(mean_m1j, lower_m1j, upper_m1j, age_years)
+
+m1j_predict <- m1j_predict %>% 
+  pivot_longer(cols = -age_years,
+               names_to = c(".value", "model"),
+               names_sep = "_",
+               values_to = "value")
+
+knots <- m1j_knots
+
+plot_m1j <- m1j_predict %>% 
+  ggplot(aes(x = age_years, y = mean, colour = model)) + 
+  geom_line()+
+  geom_ribbon(aes(ymin = lower, ymax = upper), alpha = 0.3)+
+  geom_vline(xintercept = knots)+
+  scale_x_continuous(breaks = c(0 , 2, 4, 6, 8, 10, 12, 14, 16, 18))+
+  scale_y_continuous(limits = c(12, 25))+
+  theme_minimal()
+
+plot_m1j
+
+```
+
+The second best model was m1k: quadratic splines with 3 manually searched knot placements.
+
+```{r}
+
+summary(m1k)
+
+# plot
+data_predict <- data.frame(age_years = seq(0,18,length.out=1000))
+
+m1k_predict <- predict(m1k, data_predict, se = TRUE)
+
+m1k_predict <- data.frame(m1k_predict[2], m1k_predict[1])
+
+m1k_predict <- m1k_predict %>% 
+  mutate(lower_m1k = fit - 1.96* se.fit,
+         upper_m1k = fit - 1.96* se.fit) %>% 
+  rename("mean_m1k" = "fit")
+
+m1k_predict <- m1k_predict %>% 
+  cbind(data_predict) %>% 
+  select(mean_m1k, lower_m1k, upper_m1k, age_years)
+
+m1k_predict <- m1k_predict %>% 
+  pivot_longer(cols = -age_years,
+               names_to = c(".value", "model"),
+               names_sep = "_",
+               values_to = "value")
+
+knots <- attr(splines::bs(data$age_years, degree = 3, df = 6), "knots")
+
+plot_m1k <- m1k_predict %>% 
+  ggplot(aes(x = age_years, y = mean, colour = model)) + 
+  geom_line()+
+  geom_ribbon(aes(ymin = lower, ymax = upper), alpha = 0.3)+
+  geom_vline(xintercept = knots)+
+  scale_x_continuous(breaks = c(0 , 2, 4, 6, 8, 10, 12, 14, 16, 18))+
+  scale_y_continuous(limits = c(12, 25))+
+  theme_minimal()
+
+plot_m1k
+
+```
+
+### Compare best models to expected pattern
+
+```{r}
+
+# penalized splines
+
+mgam <- gam(bmi ~ s(age_years, bs = "bs", m = c(3,2)), data = data)
+
+summary(mgam)
+
+mgam_predict <- predict(mgam, data_predict, se = TRUE)
+
+mgam_predict <- data.frame(mgam_predict[2], mgam_predict[1])
+
+mgam_predict <- mgam_predict %>% 
+  mutate(lower_gam = fit - 1.96 * se.fit,
+         upper_gam = fit + 1.96 * se.fit) %>% 
+  rename("mean_gam" = "fit")
+
+mgam_predict <- mgam_predict %>% 
+  cbind(data_predict) %>% 
+  select(mean_gam, lower_gam, upper_gam, age_years)
+
+mgam_predict <- mgam_predict %>% 
+  pivot_longer(cols = -age_years,
+               names_to = c(".value", "model"),
+               names_sep = "_",
+               values_to = "value")
+
+# loess
+
+mloess <- loess(bmi ~ age_years, data = data)
+
+summary(mloess)
+
+mloess_predict <- predict(mloess, data_predict, se = TRUE)
+
+mloess_predict <- data.frame(mloess_predict[2], mloess_predict[1])
+
+mloess_predict <- mloess_predict %>% 
+  mutate(lower_loess = fit - 1.96* se.fit,
+         upper_loess = fit - 1.96* se.fit) %>% 
+  rename("mean_loess" = "fit")
+
+mloess_predict <- mloess_predict %>% 
+  cbind(data_predict) %>% 
+  select(mean_loess, lower_loess, upper_loess, age_years)
+
+mloess_predict <- mloess_predict %>% 
+  pivot_longer(cols = -age_years,
+               names_to = c(".value", "model"),
+               names_sep = "_",
+               values_to = "value")
+
+# WHO growth references
+
+who_predict <- interpolated_ukwho_bmi %>% 
+  mutate(mean = M,
+         age_years = age_days/365.25,
+         model = case_when(sex == "m" ~ "who_boys",
+                           sex == "f" ~ "who_girls"),
+         lower = NA,
+         upper = NA) %>% 
+  select(age_years, model, mean, lower, upper)
+
+models_predict <- rbind(m1k_predict, m1j_predict, mloess_predict, mgam_predict, who_predict) %>% 
+  mutate(model = case_when(model == "m1k" ~ "quadratic, 3 manual knots",
+                           model == "m1j" ~ "quadratic, 2 manual knots",
+                           TRUE ~ model))
+
+
+plot_models <- models_predict %>% 
+  filter(model == "who_girls" | model == "who_boys") %>% 
+  ggplot(aes(x = age_years, y = mean, colour = model)) + 
+  geom_line() + 
+  scale_x_continuous(breaks = c(0, 2, 4, 6, 8, 10, 12, 14, 16, 18)) +  
+  scale_y_continuous(limits = c(12, 25)) +
+  scale_color_manual(values = c("who_girls" = "red", "who_boys" = "blue"))+
+  theme_minimal()+
+  labs(y = "Mean BMI (kg/m^2)",
+         x = "Age (years)")
+
+plot_models
+
+plot_models <- models_predict %>% 
+  filter(model == "who_girls" | model == "who_boys" | model == "gam" | model == "loess") %>% 
+  ggplot(aes(x = age_years, y = mean, colour = model)) + 
+  geom_line() + 
+  scale_x_continuous(breaks = c(0, 2, 4, 6, 8, 10, 12, 14, 16, 18)) +  
+  scale_y_continuous(limits = c(12, 25)) +
+  scale_color_manual(values = c("who_girls" = "red", "who_boys" = "blue", "gam" = "black", "loess" = "grey"))+
+  theme_minimal()+
+  labs(y = "Mean BMI (kg/m^2)",
+         x = "Age (years)")
+
+plot_models
+
+plot_models <- models_predict %>% 
+  ggplot(aes(x = age_years, y = mean, colour = model)) + 
+  geom_line() + 
+  scale_x_continuous(breaks = c(0, 2, 4, 6, 8, 10, 12, 14, 16, 18)) +  
+  scale_y_continuous(limits = c(12, 25)) +
+  scale_color_manual(values = c("who_girls" = "red", "who_boys" = "blue", "gam" = "black", "loess" = "grey", "quadratic, 3 manual knots" = "green", "quadratic, 2 manual knots" = "yellow"))+
+  theme_minimal()+
+  labs(y = "Mean BMI (kg/m^2)",
+         x = "Age (years)")
+
+plot_models
+
+```
+
+# Best 1-class hlme model
+## Estimate models
+
+```{r}
+sdf
+# quadratic splines with 2 knots
+
+m1r <- hlme(fixed = bmi ~ splines::bs(age_years, knots = c(0.6650824, 9.80449), degree = 2),
+            random = ~ -1,
+            subject = "participant_id",
+            ng = 1,
+            nwg = FALSE,
+            idiag = FALSE,
+            data = data)
+
+m1s <- hlme(fixed = bmi ~ splines::bs(age_years, degree = 2 , df = 4),
+            random = ~ -1,
+            subject = "participant_id",
+            ng = 1,
+            nwg = FALSE,
+            idiag = FALSE,
+            data = data)
+
+
+# quadratic splines with 3 knots
+
+m1t <- hlme(fixed = bmi ~ splines::bs(age_years, knots = c(0.6650824, 10.34597, 13.7964), degree = 2),
+            random = ~ -1,
+            subject = "participant_id",
+            ng = 1,
+            nwg = FALSE,
+            idiag = FALSE,
+            data = data)
+
+m1u <- hlme(fixed = bmi ~ splines::bs(age_years, degree = 2, df = 5),
+            random = ~ -1,
+            subject = "participant_id",
+            ng = 1,
+            nwg = FALSE,
+            idiag = FALSE,
+            data = data)
+
+```
+
+
+## Choose best model
+
+Look at model summary
+
+```{r}
+
+summarytable(m1r, m1s, m1t, m1u, which = c("AIC", "BIC", "loglik", "npm"))
+
+```
+
+Choose best model
+
+```{r}
+
+select_best_model_of_class <- function(models, BIC = 0, p_Loglik = 0.05){
+  
+  invisible(capture.output(suppressMessages(suppressWarnings(models <- models[order(sapply(models, function(model) summarytable(model, which="npm")[1,1]))]))))
+  
+  best_model <- models[[1]]
+  best_model_index <- 1
+  
+  for (i in 2:length(models)){
+  
+  cat("compare", names(models)[i], "to" , names(models)[best_model_index], "\n\n")
+  
+  new_model = models[[i]]
+  
+  summary_models <- summarytable(best_model, new_model, which = c("BIC", "loglik", "npm"))
+  BIC_best_model <- summary_models[1,1]
+  Loglik_best_model <- summary_models[1,2]
+  number_parameters_best_model <- summary_models[1,3]
+  BIC_new_model <- summary_models[2,1]
+  Loglik_new_model <- summary_models[2,2]
+  number_parameters_new_model <- summary_models[2,3]
+  
+  BIC_difference <- BIC_new_model - BIC_best_model
+  Loglik_test <- pchisq(-2*(Loglik_best_model - Loglik_new_model),
+                        df = abs(number_parameters_new_model-number_parameters_best_model),
+                        lower.tail = FALSE)
+  
+  cat("\nBIC difference:\t\t\t", BIC_difference, "\n")
+  cat("p-value Likelihood Ratio test:\t", Loglik_test, "\n\n")
+  
+  if (BIC_difference <= BIC & Loglik_test <= p_Loglik){
+    
+    cat(names(models)[i],"better than", names(models)[best_model_index], "\n\n")
+    cat(paste(rep("-",80), collapse= ""), "\n\n")
+    
+    best_model <- new_model
+    best_model_index <- i
+  } else {
+    
+    cat(names(models)[i],"not better than", names(models)[best_model_index], "\n\n")
+    cat(paste(rep("-",80), collapse= ""), "\n\n")
+    
+  }
+  
+  }
+
+  cat("best model:", names(models)[best_model_index])
+  return(models[best_model_index])
+  
+}
+
+
+```
+
+
+Choose best model
+
+```{r}
+
+models = list(
+  m1r = m1r,
+  m1s = m1s,
+  m1t = m1t,
+  m1u = m1u
+)
+
+select_best_model_of_class(models)
+
+```
+
+
+## Plot models
+
+Best model: m1r
+
+```{r}
+
+summary(m1r)
+
+data_predict <- data.frame(age_years = seq(0,18,length.out=1000))
+
+m1r_predict <- predictY(m1r, data_predict, var.time = "age_years", draws = TRUE)
+
+m1r_predict <- data.frame(m1r_predict[2], m1r_predict[1])
+
+m1r_predict <- m1r_predict %>%
+  rename("mean_m1r" = "pred.Ypred",
+         "lower_m1r" = "pred.lower.Ypred",
+         "upper_m1r" = "pred.upper.Ypred")
+
+m1r_predict <- m1r_predict %>% 
+  pivot_longer(cols = -age_years,
+               names_to = c(".value", "model"),
+               names_sep = "_",
+               values_to = "value")
+
+knots <- attr(splines::bs(data$age_years, degree = 3, df = 6), "knots")
+
+plot_m1r <- m1r_predict %>% 
+  ggplot(aes(x = age_years, y = mean, colour = model)) + 
+  geom_line()+
+  geom_ribbon(aes(ymin = lower, ymax = upper), alpha = 0.3)+
+  geom_vline(xintercept = knots)+
+  scale_x_continuous(breaks = c(0 , 2, 4, 6, 8, 10, 12, 14, 16, 18))+
+  scale_y_continuous(limits = c(12, 25))+
+  theme_minimal()
+
+plot_m1r
+
+```
+
+Second best model: m1t
+
+```{r}
+
+summary(m1t)
+
+data_predict <- data.frame(age_years = seq(0,18,length.out=1000))
+
+m1t_predict <- predictY(m1t, data_predict, var.time = "age_years", draws = TRUE)
+
+m1t_predict <- data.frame(m1t_predict[2], m1t_predict[1])
+
+m1t_predict <- m1t_predict %>%
+  rename("mean_m1t" = "pred.Ypred",
+         "lower_m1t" = "pred.lower.Ypred",
+         "upper_m1t" = "pred.upper.Ypred")
+
+m1t_predict <- m1t_predict %>% 
+  pivot_longer(cols = -age_years,
+               names_to = c(".value", "model"),
+               names_sep = "_",
+               values_to = "value")
+
+plot_m1t <- m1t_predict %>% 
+  ggplot(aes(x = age_years, y = mean, colour = model)) + 
+  geom_line()+
+  geom_ribbon(aes(ymin = lower, ymax = upper), alpha = 0.3)+
+  geom_vline(xintercept = knots)+
+  scale_x_continuous(breaks = c(0 , 2, 4, 6, 8, 10, 12, 14, 16, 18))+
+  scale_y_continuous(limits = c(12, 25))+
+  theme_minimal()
+
+plot_m1t
+
+```
+
+### Compare best models to expected pattern
+
+```{r}
+
+models_predict <- rbind(m1r_predict, m1t_predict, mloess_predict, mgam_predict, who_predict)
+
+
+plot_models <- ggplot(aes(x = age_years, y = mean, colour = model), data = models_predict) + 
+  geom_line() + 
+  scale_x_continuous(breaks = c(0, 2, 4, 6, 8, 10, 12, 14, 16, 18)) +  
+  scale_y_continuous(limits = c(12, 25)) +  
+  theme_minimal()
+
+plot_models
+
+```
+
+Models m1r and m1t seem to fit close to the expected patterns from the WHO growth charts. We will continue with the quadratic splines with 2 or 3 manually placed knots. We will estimate the 2-class to 7-class models on ubelix.
+
