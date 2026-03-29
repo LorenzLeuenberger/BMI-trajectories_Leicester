@@ -1,0 +1,439 @@
+---
+title: "1 class models with raw bmi and spline patterns"
+author: "Lorenz Leuenberger"
+date: "`r date()`"
+title-block-banner: "#e4003c"
+format: 
+  html:
+    toc: true
+    number-sections: true
+    code-fold: show
+    code-tools: true
+    df-print: paged
+    embed-resources: true
+---
+
+# Introduction
+
+To model the higher class models (n >= 2) on Ubelix we first need to specify and model the baseline models (n = 1). Because they are not compute intensive we can run them locally.
+
+The modelling approach and the specification and naming of the models is described in the Concept sheet.
+
+We will first model sex and ethnicity separately and then combine.
+We will model raw bmi.
+
+# Import data
+
+libraries
+
+```{r}
+
+library(tidyverse)
+library(here)
+library(lcmm)
+
+```
+
+
+```{r}
+
+data <- read.csv(file = here("data", "processed", "Leicester_anthro_pseudonymized_18.csv"))
+
+```
+
+
+# Sex
+
+Model female and male data separately
+
+## Female
+
+Select data
+
+```{r}
+
+data_female <- data %>% 
+  filter(sex == "f")
+
+```
+
+### Estimate models
+
+```{r}
+
+bmi_m1r_female <- hlme(fixed = bmi ~ splines::bs(age_years, knots = c(0.6650824, 9.80449), degree = 2),
+                       random = ~ -1,
+                       subject = "participant_id",
+                       ng = 1,
+                       nwg = FALSE,
+                       idiag = FALSE,
+                       data = data_female)
+
+bmi_m1s_female <- hlme(fixed = bmi ~ splines::bs(age_years, knots = c(0.6650824, 9.80449), degree = 2),
+                       random = ~ 1,
+                       subject = "participant_id",
+                       ng = 1,
+                       nwg = FALSE,
+                       idiag = FALSE,
+                       data = data_female)
+
+bmi_m1t_female <- hlme(fixed = bmi ~ splines::bs(age_years, knots = c(0.6650824, 9.80449), degree = 2),
+                       random = ~ 1 + age_years,
+                       subject = "participant_id",
+                       ng = 1,
+                       nwg = FALSE,
+                       idiag = FALSE,
+                       data = data_female)
+
+bmi_m1u_female <- hlme(fixed = bmi ~ splines::bs(age_years, knots = c(0.6650824, 10.34597, 13.7964), degree = 2),
+                       random = ~ -1,
+                       subject = "participant_id",
+                       ng = 1,
+                       nwg = FALSE,
+                       idiag = FALSE,
+                       data = data_female)
+
+bmi_m1v_female <- hlme(fixed = bmi ~ splines::bs(age_years, knots = c(0.6650824, 10.34597, 13.7964), degree = 2),
+                       random = ~ 1,
+                       subject = "participant_id",
+                       ng = 1,
+                       nwg = FALSE,
+                       idiag = FALSE,
+                       data = data_female)
+
+bmi_m1w_female <- hlme(fixed = bmi ~ splines::bs(age_years, knots = c(0.6650824, 10.34597, 13.7964), degree = 2),
+                       random = ~ 1 + age_years,
+                       subject = "participant_id",
+                       ng = 1,
+                       nwg = FALSE,
+                       idiag = FALSE,
+                       data = data_female)
+
+```
+
+
+### Save models
+
+Save models to .Rdata file
+
+```{r}
+
+save(data_female, bmi_m1r_female, bmi_m1s_female, bmi_m1t_female, bmi_m1u_female, bmi_m1v_female, bmi_m1w_female, file = here("ubelix", "input", "final_splines", "bmi_data_and_1-class_female.Rdata"))
+
+```
+
+## Male
+
+
+Select data
+
+```{r}
+
+data_male <- data %>% 
+  filter(sex == "m")
+
+```
+
+### Estimate models
+
+```{r}
+
+bmi_m1r_male <- hlme(fixed = bmi ~ splines::bs(age_years, knots = c(0.6650824, 9.80449), degree = 2),
+                       random = ~ -1,
+                       subject = "participant_id",
+                       ng = 1,
+                       nwg = FALSE,
+                       idiag = FALSE,
+                       data = data_male)
+
+bmi_m1s_male <- hlme(fixed = bmi ~ splines::bs(age_years, knots = c(0.6650824, 9.80449), degree = 2),
+                       random = ~ 1,
+                       subject = "participant_id",
+                       ng = 1,
+                       nwg = FALSE,
+                       idiag = FALSE,
+                       data = data_male)
+
+bmi_m1t_male <- hlme(fixed = bmi ~ splines::bs(age_years, knots = c(0.6650824, 9.80449), degree = 2),
+                       random = ~ 1 + age_years,
+                       subject = "participant_id",
+                       ng = 1,
+                       nwg = FALSE,
+                       idiag = FALSE,
+                       data = data_male)
+
+bmi_m1u_male <- hlme(fixed = bmi ~ splines::bs(age_years, knots = c(0.6650824, 10.34597, 13.7964), degree = 2),
+                       random = ~ -1,
+                       subject = "participant_id",
+                       ng = 1,
+                       nwg = FALSE,
+                       idiag = FALSE,
+                       data = data_male)
+
+bmi_m1v_male <- hlme(fixed = bmi ~ splines::bs(age_years, knots = c(0.6650824, 10.34597, 13.7964), degree = 2),
+                       random = ~ 1,
+                       subject = "participant_id",
+                       ng = 1,
+                       nwg = FALSE,
+                       idiag = FALSE,
+                       data = data_male)
+
+bmi_m1w_male <- hlme(fixed = bmi ~ splines::bs(age_years, knots = c(0.6650824, 10.34597, 13.7964), degree = 2),
+                       random = ~ 1 + age_years,
+                       subject = "participant_id",
+                       ng = 1,
+                       nwg = FALSE,
+                       idiag = FALSE,
+                       data = data_male)
+
+```
+
+
+### Save models
+
+Save models to .Rdata file
+
+```{r}
+
+save(data_male, bmi_m1r_male, bmi_m1s_male, bmi_m1t_male, bmi_m1u_male, bmi_m1v_male, bmi_m1w_male, file = here("ubelix", "input", "final_splines", "bmi_data_and_1-class_male.Rdata"))
+
+```
+
+# Ethnicity
+
+Model European and Non-European ethnicity data separately
+
+## Europe
+
+Select data
+
+```{r}
+
+data_europe <- data %>% 
+  filter(ethnicity_cohort == "whites")
+
+```
+
+### Estimate models
+
+
+```{r}
+
+bmi_m1r_europe <- hlme(fixed = bmi ~ splines::bs(age_years, knots = c(0.6650824, 9.80449), degree = 2),
+                       random = ~ -1,
+                       subject = "participant_id",
+                       ng = 1,
+                       nwg = FALSE,
+                       idiag = FALSE,
+                       data = data_europe)
+
+bmi_m1s_europe <- hlme(fixed = bmi ~ splines::bs(age_years, knots = c(0.6650824, 9.80449), degree = 2),
+                       random = ~ 1,
+                       subject = "participant_id",
+                       ng = 1,
+                       nwg = FALSE,
+                       idiag = FALSE,
+                       data = data_europe)
+
+bmi_m1t_europe <- hlme(fixed = bmi ~ splines::bs(age_years, knots = c(0.6650824, 9.80449), degree = 2),
+                       random = ~ 1 + age_years,
+                       subject = "participant_id",
+                       ng = 1,
+                       nwg = FALSE,
+                       idiag = FALSE,
+                       data = data_europe)
+
+bmi_m1u_europe <- hlme(fixed = bmi ~ splines::bs(age_years, knots = c(0.6650824, 10.34597, 13.7964), degree = 2),
+                       random = ~ -1,
+                       subject = "participant_id",
+                       ng = 1,
+                       nwg = FALSE,
+                       idiag = FALSE,
+                       data = data_europe)
+
+bmi_m1v_europe <- hlme(fixed = bmi ~ splines::bs(age_years, knots = c(0.6650824, 10.34597, 13.7964), degree = 2),
+                       random = ~ 1,
+                       subject = "participant_id",
+                       ng = 1,
+                       nwg = FALSE,
+                       idiag = FALSE,
+                       data = data_europe)
+
+bmi_m1w_europe <- hlme(fixed = bmi ~ splines::bs(age_years, knots = c(0.6650824, 10.34597, 13.7964), degree = 2),
+                       random = ~ 1 + age_years,
+                       subject = "participant_id",
+                       ng = 1,
+                       nwg = FALSE,
+                       idiag = FALSE,
+                       data = data_europe)
+
+```
+
+
+### Save models
+
+Save models to .Rdata file
+
+```{r}
+
+save(data_europe, bmi_m1r_europe, bmi_m1s_europe, bmi_m1t_europe, bmi_m1u_europe, bmi_m1v_europe, bmi_m1w_europe, file = here("ubelix", "input", "final_splines", "bmi_data_and_1-class_europe.Rdata"))
+
+```
+
+## Asia
+
+Select data
+
+```{r}
+
+data_asia <- data %>% 
+  filter(ethnicity_cohort == "asians")
+
+```
+
+### Estimate models
+
+
+```{r}
+
+bmi_m1r_asia <- hlme(fixed = bmi ~ splines::bs(age_years, knots = c(0.6650824, 9.80449), degree = 2),
+                       random = ~ -1,
+                       subject = "participant_id",
+                       ng = 1,
+                       nwg = FALSE,
+                       idiag = FALSE,
+                       data = data_asia)
+
+bmi_m1s_asia <- hlme(fixed = bmi ~ splines::bs(age_years, knots = c(0.6650824, 9.80449), degree = 2),
+                       random = ~ 1,
+                       subject = "participant_id",
+                       ng = 1,
+                       nwg = FALSE,
+                       idiag = FALSE,
+                       data = data_asia)
+
+bmi_m1t_asia <- hlme(fixed = bmi ~ splines::bs(age_years, knots = c(0.6650824, 9.80449), degree = 2),
+                       random = ~ 1 + age_years,
+                       subject = "participant_id",
+                       ng = 1,
+                       nwg = FALSE,
+                       idiag = FALSE,
+                       data = data_asia)
+
+bmi_m1u_asia <- hlme(fixed = bmi ~ splines::bs(age_years, knots = c(0.6650824, 10.34597, 13.7964), degree = 2),
+                       random = ~ -1,
+                       subject = "participant_id",
+                       ng = 1,
+                       nwg = FALSE,
+                       idiag = FALSE,
+                       data = data_asia)
+
+bmi_m1v_asia <- hlme(fixed = bmi ~ splines::bs(age_years, knots = c(0.6650824, 10.34597, 13.7964), degree = 2),
+                       random = ~ 1,
+                       subject = "participant_id",
+                       ng = 1,
+                       nwg = FALSE,
+                       idiag = FALSE,
+                       data = data_asia)
+
+bmi_m1w_asia <- hlme(fixed = bmi ~ splines::bs(age_years, knots = c(0.6650824, 10.34597, 13.7964), degree = 2),
+                       random = ~ 1 + age_years,
+                       subject = "participant_id",
+                       ng = 1,
+                       nwg = FALSE,
+                       idiag = FALSE,
+                       data = data_asia)
+
+```
+
+
+### Save models
+
+Save models to .Rdata file
+
+```{r}
+
+save(data_asia, bmi_m1r_asia, bmi_m1s_asia, bmi_m1t_asia, bmi_m1u_asia, bmi_m1v_asia, bmi_m1w_asia, file = here("ubelix", "input", "final_splines", "bmi_data_and_1-class_asia.Rdata"))
+
+```
+
+# Total
+
+Model all data together
+
+
+Select data
+
+```{r}
+
+data_total <- data
+
+```
+
+### Estimate models
+
+
+```{r}
+
+bmi_m1r_total <- hlme(fixed = bmi ~ splines::bs(age_years, knots = c(0.6650824, 9.80449), degree = 2),
+                       random = ~ -1,
+                       subject = "participant_id",
+                       ng = 1,
+                       nwg = FALSE,
+                       idiag = FALSE,
+                       data = data_total)
+
+bmi_m1s_total <- hlme(fixed = bmi ~ splines::bs(age_years, knots = c(0.6650824, 9.80449), degree = 2),
+                       random = ~ 1,
+                       subject = "participant_id",
+                       ng = 1,
+                       nwg = FALSE,
+                       idiag = FALSE,
+                       data = data_total)
+
+bmi_m1t_total <- hlme(fixed = bmi ~ splines::bs(age_years, knots = c(0.6650824, 9.80449), degree = 2),
+                       random = ~ 1 + age_years,
+                       subject = "participant_id",
+                       ng = 1,
+                       nwg = FALSE,
+                       idiag = FALSE,
+                       data = data_total)
+
+bmi_m1u_total <- hlme(fixed = bmi ~ splines::bs(age_years, knots = c(0.6650824, 10.34597, 13.7964), degree = 2),
+                       random = ~ -1,
+                       subject = "participant_id",
+                       ng = 1,
+                       nwg = FALSE,
+                       idiag = FALSE,
+                       data = data_total)
+
+bmi_m1v_total <- hlme(fixed = bmi ~ splines::bs(age_years, knots = c(0.6650824, 10.34597, 13.7964), degree = 2),
+                       random = ~ 1,
+                       subject = "participant_id",
+                       ng = 1,
+                       nwg = FALSE,
+                       idiag = FALSE,
+                       data = data_total)
+
+bmi_m1w_total <- hlme(fixed = bmi ~ splines::bs(age_years, knots = c(0.6650824, 10.34597, 13.7964), degree = 2),
+                       random = ~ 1 + age_years,
+                       subject = "participant_id",
+                       ng = 1,
+                       nwg = FALSE,
+                       idiag = FALSE,
+                       data = data_total)
+
+```
+
+
+### Save models
+
+Save models to .Rdata file
+
+```{r}
+
+save(data_total, bmi_m1r_total, bmi_m1s_total, bmi_m1t_total, bmi_m1u_total, bmi_m1v_total, bmi_m1w_total, file = here("ubelix", "input", "final_splines", "bmi_data_and_1-class_total.Rdata"))
+
+```
+
+
